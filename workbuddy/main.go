@@ -77,6 +77,7 @@ import (
 const (
 	providerName  = "workbuddy"
 	authFileName  = "workbuddy.json"
+	pluginLogoURL = "https://raw.githubusercontent.com/DGZSbot/ai-icon/refs/heads/main/WorkBuddy.png"
 	upstreamBase  = "https://copilot.tencent.com"
 	clientUA      = "CLI/2.63.2 CodeBuddy/2.63.2"
 	originReferer = "https://www.codebuddy.cn"
@@ -309,9 +310,10 @@ func wbRegistration() registration {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             providerName,
-			Version:          "0.3.0",
+			Version:          "0.3.1",
 			Author:           "lovingfish (clean-room rebuild; original workbuddy by Sliverkiss), extended by Sliverkiss",
 			GitHubRepository: "https://github.com/lovingfish/workbuddy-cliproxy",
+			Logo:             pluginLogoURL,
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "checkin_auto", Type: "boolean", Description: "Enable daily auto check-in at 09:00 and 21:00 local time (default true)."},
 				{Name: "models", Type: "array", Description: "Optional model list. Each item can have id, name, alias, context, max_tokens, enabled, reasoning."},
@@ -980,6 +982,7 @@ func handleStartLogin(raw []byte) ([]byte, error) {
 		URL:       st.AuthURL,
 		State:     st.State,
 		ExpiresAt: time.Now().Add(loginTTL).UTC(),
+		Metadata:  map[string]any{"logo": pluginLogoURL},
 	})
 }
 
