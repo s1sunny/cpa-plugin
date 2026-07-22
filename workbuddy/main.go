@@ -329,7 +329,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.3.2"
+var version = "0.3.3"
 
 func wbRegistration() registration {
 	return registration{
@@ -1482,17 +1482,15 @@ func clientNeedsSSEFrame(metadata map[string]any) bool {
 	}
 }
 
-// aggregateSSE reads an upstream SSE stream and emits one chunk per data event.
-// Empty tool-call shells are stripped and the trailing [DONE] is dropped
-// (the host appends its own stream terminator). When sseFramed is true each
-// payload is emitted as a "data: " line for cross-format translators; otherwise
-// the payload is the raw JSON object and the host chat-completions writer adds
-// the framing itself. A mid-stream read error aborts collection and is
-// returned so the caller records the attempt as failed.
-func aggregateSSE(r io.Reader, sseFramed bool) ([]pluginapi.ExecutorStreamChunk, error) {
-	return aggregateSSEWithCollector(r, sseFramed, nil)
-}
-
+// aggregateSSEWithCollector reads an upstream SSE stream and emits one chunk
+// per data event. Empty tool-call shells are stripped and the trailing [DONE]
+// is dropped (the host appends its own stream terminator). When sseFramed is
+// true each payload is emitted as a "data: " line for cross-format
+// translators; otherwise the payload is the raw JSON object and the host
+// chat-completions writer adds the framing itself. A mid-stream read error
+// aborts collection and is returned so the caller records the attempt as
+// failed. The collector, when non-nil, observes raw upstream chunks for usage
+// extraction.
 func aggregateSSEWithCollector(r io.Reader, sseFramed bool, collector *sseUsageCollector) ([]pluginapi.ExecutorStreamChunk, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
@@ -1777,6 +1775,13 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 	if err := scanner.Err(); err != nil {
 		scanErr = err
 	}
+	// A mid-stream read failure means the folded completion is truncated. The
+	// host discards the payload entirely when the plugin returns an error
+	// (sdk/api/handlers executeWithPluginExecutor), so fail fast here instead
+	// of assembling a partial completion nobody can safely consume.
+	if scanErr != nil {
+		return nil, fmt.Errorf("upstream stream read error: %w", scanErr)
+	}
 
 	message := map[string]any{"role": firstNonEmpty(role, "assistant"), "content": content}
 	if reasoning != "" {
@@ -1810,11 +1815,6 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 	out, err := json.Marshal(result)
 	if err != nil {
 		return nil, err
-	}
-	// A mid-stream read failure means the folded completion is truncated; the
-	// caller must treat this as an upstream failure, not a success.
-	if scanErr != nil {
-		return out, fmt.Errorf("upstream stream read error: %w", scanErr)
 	}
 	return out, nil
 }
