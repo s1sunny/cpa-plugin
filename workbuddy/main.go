@@ -338,7 +338,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.3.5"
+var version = "0.3.6"
 
 func wbRegistration() registration {
 	return registration{
@@ -1592,7 +1592,18 @@ func isEmptyValue(v any) bool {
 	case []any:
 		return len(x) == 0
 	case map[string]any:
-		return len(x) == 0
+		if len(x) == 0 {
+			return true
+		}
+		// Legacy function_call shell: {"name":"","arguments":""} is the
+		// upstream's terminal-chunk artifact, not a real call — treat as empty
+		// when every value is itself empty.
+		for _, val := range x {
+			if !isEmptyValue(val) {
+				return false
+			}
+		}
+		return true
 	}
 	return false
 }
