@@ -277,10 +277,6 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handlePollLogin(request)
 	case pluginabi.MethodAuthRefresh:
 		return handleRefreshAuth(request)
-	case pluginabi.MethodFrontendAuthIdentifier:
-		return okEnvelope(identifierResponse{Identifier: providerName})
-	case pluginabi.MethodFrontendAuthAuthenticate:
-		return handleFrontendAuth(request)
 	case pluginabi.MethodExecutorIdentifier:
 		return okEnvelope(identifierResponse{Identifier: providerName})
 	case pluginabi.MethodExecutorExecute:
@@ -338,7 +334,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.3.16"
+var version = "0.3.17"
 
 func wbRegistration() registration {
 	return registration{
@@ -357,7 +353,7 @@ func wbRegistration() registration {
 		Capabilities: registrationCapability{
 			ModelProvider:         true,
 			AuthProvider:          true,
-			FrontendAuthProvider:  true,
+			FrontendAuthProvider:  false,
 			Executor:              true,
 			ExecutorModelScope:    pluginapi.ExecutorModelScopeBoth,
 			ExecutorInputFormats:  []string{"chat-completions"},
@@ -881,11 +877,6 @@ func handleModelForAuth(raw []byte) ([]byte, error) {
 	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: models})
 }
 
-func handleFrontendAuth(raw []byte) ([]byte, error) {
-	// WorkBuddy relies on the standard OAuth login flow (auth.login.*).
-	// Returning not-authenticated lets the host fall back to normal auth.
-	return okEnvelope(pluginapi.FrontendAuthResponse{Authenticated: false})
-}
 
 // hostAuthListFiles lists all auth files known to the host.
 func hostAuthListFiles() ([]pluginapi.HostAuthFileEntry, error) {
