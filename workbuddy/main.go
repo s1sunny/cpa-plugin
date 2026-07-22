@@ -338,7 +338,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.3.6"
+var version = "0.3.7"
 
 func wbRegistration() registration {
 	return registration{
@@ -1247,6 +1247,17 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 	})
 }
 
+// preserveExpiry reuses the previous token's expiresAt when the refresh
+// response omits expiresIn (some CodeBuddy deployments return only the token
+// pair). Zero would tell the host the credential is permanently expired and
+// trigger a refresh storm on every request.
+func preserveExpiry(newExpiry, oldExpiry int64) int64 {
+	if newExpiry > 0 {
+		return newExpiry
+	}
+	return oldExpiry
+}
+
 func handleRefreshAuth(raw []byte) ([]byte, error) {
 	var req pluginapi.AuthRefreshRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -1282,7 +1293,10 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	if tok.Domain != "" {
 		sa.Auth.Domain = tok.Domain
 	}
-	sa.Auth.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
+	sa.Auth.ExpiresAt = preserveExpiry(
+		time.Now().Add(time.Duration(tok.ExpiresIn)*time.Second).Unix(),
+		sa.Auth.ExpiresAt,
+	)
 	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthData(sa)})
 }
 
