@@ -21,11 +21,23 @@ Tencent **CodeBuddy** (`copilot.tencent.com`) provider plugin for [CLIProxyAPI (
 
 ### 安装
 
+**推荐：从 GitHub Release 安装多架构包**（符合 CPA 插件商店 `ArchiveName`）：
+
 ```bash
-# 产物命名（GitHub Release / 手工）
-# workbuddy_linux_arm64.so  /  workbuddy_linux_amd64.so
-cp workbuddy_linux_arm64.so /path/to/cliproxyapi/plugins/workbuddy.so
+# linux/amd64（x86_64 服务器）
+unzip workbuddy_0.4.1_linux_amd64.zip   # → workbuddy.so
+cp workbuddy.so /path/to/cliproxyapi/plugins/workbuddy.so
+
+# linux/arm64
+# unzip workbuddy_0.4.1_linux_arm64.zip
+
+# macOS
+# unzip workbuddy_0.4.1_darwin_arm64.zip  # → workbuddy.dylib
+# Windows
+# unzip workbuddy_0.4.1_windows_amd64.zip # → workbuddy.dll
 ```
+
+也可放在平台子目录：`plugins/linux/amd64/`、`plugins/darwin/arm64/` 等。
 
 ```yaml
 plugins:
@@ -38,15 +50,24 @@ plugins:
       # scheduler_mode: off   # or credits
 ```
 
-重启 CPA。仅替换 `plugins/workbuddy.so`，**不要改 CPA / CPAMP 源码**。
+重启 CPA。
 
-### CPAMP / Plugins Store
+### 登录 / 凭证
 
-- 仓库：`https://github.com/Sliverkiss/cpa-plugin`（`GitHubRepository` 元数据）
-- 安装：CPAMP 插件商店选 Release，或拷贝上表 so 到 `plugins.dir`
-- 资产约定：`workbuddy_<os>_<arch>.so`（见 `.github/workflows/release.yml`）
-- 侧栏：资源页 `/v0/resource/plugins/workbuddy/panel`
-- OAuth：管理端登录页使用插件 Logo
+1. CPA 管理端 OAuth 选择 WorkBuddy 完成授权；或  
+2. 面板粘贴凭证 JSON → `POST .../import`  
+3. 落盘：`auths/workbuddy-<uid>.json`（多账号不覆盖）
+
+### 预期模型
+
+`/v1/models` 中 `owned_by=workbuddy` 的动态列表（账号权限为准），常见：`deepseek-v4-flash` / `deepseek-v4-pro` / `glm-5.x` / `kimi-k2.7` / `hy3*` / `minimax-m3` 等；可用 `oauth-model-alias` / `oauth-excluded-models` 管理。
+
+### CPAMP / 远程更新
+
+- 源码仓：`https://github.com/Sliverkiss/cpa-plugin`
+- **商店源（registry）**：`https://raw.githubusercontent.com/Sliverkiss/cpa-plugin/main/registry.json`
+- Release 资产：`workbuddy_<ver>_<goos>_<goarch>.zip` + `checksums.txt`
+- 侧栏：`/v0/resource/plugins/workbuddy/panel`
 
 ### 构建与测试
 
@@ -98,7 +119,31 @@ OAuth multi-account provider, dynamic models, production executor (SSE, tools, a
 
 ### Install
 
-Copy the platform `.so` to CPA `plugins/` as `workbuddy.so`, enable under `plugins.configs.workbuddy`, restart. Do **not** patch CPA or CPA-Manager-Plus sources.
+Download the matching zip from [Releases](https://github.com/Sliverkiss/cpa-plugin/releases):
+
+```text
+workbuddy_<version>_linux_amd64.zip   # workbuddy.so
+workbuddy_<version>_linux_arm64.zip
+workbuddy_<version>_darwin_arm64.zip  # workbuddy.dylib
+workbuddy_<version>_windows_amd64.zip # workbuddy.dll
+```
+
+Unzip and place the library in CPA `plugins/` (or `plugins/<goos>/<goarch>/`). Enable:
+
+```yaml
+plugins:
+  configs:
+    workbuddy:
+      enabled: true
+```
+
+### Remote update
+
+Add custom plugin source:
+
+```text
+https://raw.githubusercontent.com/Sliverkiss/cpa-plugin/main/registry.json
+```
 
 ### Build
 
@@ -106,7 +151,7 @@ Copy the platform `.so` to CPA `plugins/` as `workbuddy.so`, enable under `plugi
 make test && make vet && make build VERSION=$(cat VERSION)
 ```
 
-Release artifacts: `workbuddy_linux_arm64.so`, `workbuddy_linux_amd64.so` via GitHub Actions on tags `v*`.
+Release artifacts are produced by `.github/workflows/build.yml` for linux/darwin/windows/freebsd multi-arch.
 
 ### Config
 
