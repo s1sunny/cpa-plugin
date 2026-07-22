@@ -338,7 +338,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.3.14"
+var version = "0.3.15"
 
 func wbRegistration() registration {
 	return registration{
@@ -1340,7 +1340,9 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	}
 	// CodeBuddy rejects non-stream requests (code 11101), so always stream
 	// upstream and fold the chunks into a single chat.completion object.
-	body := rewriteModelInBody(rewriteSystemForUpstream(forceStreamBody(req.Payload, req.OriginalRequest)), upstreamModel)
+	// Normalize OpenAI tool_choice/tools before rewrite — upstream only accepts
+	// string tool_choice, and ignores "none" when tools[] is present.
+	body := rewriteModelInBody(normalizeToolsForUpstream(rewriteSystemForUpstream(forceStreamBody(req.Payload, req.OriginalRequest))), upstreamModel)
 	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -1393,7 +1395,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	if len(body) == 0 {
 		body = req.OriginalRequest
 	}
-	body = rewriteModelInBody(rewriteSystemForUpstream(body), upstreamModel)
+	body = rewriteModelInBody(normalizeToolsForUpstream(rewriteSystemForUpstream(body)), upstreamModel)
 
 	headers := streamHeaders()
 	sseFramed := clientNeedsSSEFrame(req.Metadata)
@@ -1654,6 +1656,97 @@ func forceStreamBody(payload, original []byte) []byte {
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return src
+	}
+	return out
+}
+
+// normalizeToolsForUpstream adapts OpenAI tools / tool_choice fields to
+// CodeBuddy's chat schema before the request is forwarded.
+//
+// Live-verified against /v2/chat/completions (2026-07):
+//  1. tool_choice is typed as string on the upstream Go struct. OpenAI's object
+//     form {"type":"function","function":{"name":"..."}} returns 400 code 11101
+//     ("cannot unmarshal object into Go struct field Request.tool_choice of
+//     type string"). Convert known object shapes to the matching string.
+//  2. tool_choice "none" is accepted but ignored when tools[] is non-empty —
+//     the model still emits tool_calls. The only reliable way to suppress tools
+//     is to omit tools (and functions) entirely.
+//
+// String values auto / required / <function name> are left untouched.
+func normalizeToolsForUpstream(payload []byte) []byte {
+	if len(payload) == 0 {
+		return payload
+	}
+	var obj map[string]any
+	if json.Unmarshal(payload, &obj) != nil {
+		return payload
+	}
+	changed := false
+
+	suppressTools := func() {
+		if _, ok := obj["tools"]; ok {
+			delete(obj, "tools")
+			changed = true
+		}
+		if _, ok := obj["functions"]; ok {
+			delete(obj, "functions")
+			changed = true
+		}
+	}
+
+	if tc, present := obj["tool_choice"]; present {
+		switch v := tc.(type) {
+		case string:
+			if strings.EqualFold(strings.TrimSpace(v), "none") {
+				delete(obj, "tool_choice")
+				suppressTools()
+				changed = true
+			}
+		case map[string]any:
+			typ, _ := v["type"].(string)
+			typ = strings.ToLower(strings.TrimSpace(typ))
+			switch typ {
+			case "none":
+				delete(obj, "tool_choice")
+				suppressTools()
+				changed = true
+			case "auto", "required":
+				obj["tool_choice"] = typ
+				changed = true
+			case "function":
+				name := ""
+				if fn, ok := v["function"].(map[string]any); ok {
+					name, _ = fn["name"].(string)
+				}
+				if name == "" {
+					name, _ = v["name"].(string)
+				}
+				name = strings.TrimSpace(name)
+				if name != "" {
+					obj["tool_choice"] = name
+				} else {
+					// Object force without a name: fall back to auto instead of 400.
+					obj["tool_choice"] = "auto"
+				}
+				changed = true
+			default:
+				// Unknown object shape → drop rather than forward a 400.
+				delete(obj, "tool_choice")
+				changed = true
+			}
+		default:
+			// null / array / number — drop to keep upstream happy.
+			delete(obj, "tool_choice")
+			changed = true
+		}
+	}
+
+	if !changed {
+		return payload
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return payload
 	}
 	return out
 }
