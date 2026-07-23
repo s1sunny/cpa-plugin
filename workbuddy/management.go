@@ -234,20 +234,25 @@ func hostAuthList() ([]pluginapi.HostAuthFileEntry, error) {
 
 // hostAuthGet fetches the credential JSON for one auth index.
 func hostAuthGet(authIndex string) (*storedAuth, error) {
-	body, _ := json.Marshal(map[string]string{"auth_index": authIndex})
-	raw, err := hostCall(pluginabi.MethodHostAuthGet, body)
+	phys, err := hostAuthGetPhysical(authIndex)
 	if err != nil {
 		return nil, err
 	}
-	var env envelope
-	if err := json.Unmarshal(raw, &env); err != nil || !env.OK {
-		return nil, fmt.Errorf("host.auth.get: bad envelope")
+	return parseStored(phys.JSON)
+}
+
+// hostAuthGetBundle is one host.auth.get for both storage and physical metadata
+// (avoids the previous double-RPC in dashboard: get + getPhysical).
+func hostAuthGetBundle(authIndex string) (*storedAuth, *hostAuthPhysical, error) {
+	phys, err := hostAuthGetPhysical(authIndex)
+	if err != nil {
+		return nil, nil, err
 	}
-	var resp rpcHostAuthGetResponse
-	if err := json.Unmarshal(env.Result, &resp); err != nil {
-		return nil, err
+	sa, err := parseStored(phys.JSON)
+	if err != nil {
+		return nil, phys, err
 	}
-	return parseStored(resp.JSON)
+	return sa, phys, nil
 }
 
 // -----------------------------------------------------------------------------
@@ -803,14 +808,14 @@ func buildDashboard(force bool) map[string]any {
 				Status:    f.Status,
 				Disabled:  f.Disabled,
 			}
-			sa, err := hostAuthGet(f.AuthIndex)
+			sa, phys, err := hostAuthGetBundle(f.AuthIndex)
 			if err != nil {
 				acct.Error = "load auth: " + err.Error()
 				out[i] = acct
 				return
 			}
 			// Physical file is source of truth for disabled (host list may lag).
-			if phys, perr := hostAuthGetPhysical(f.AuthIndex); perr == nil {
+			if phys != nil {
 				acct.Disabled = phys.Disabled
 				if phys.Name != "" {
 					acct.Name = phys.Name
@@ -845,10 +850,9 @@ func buildDashboard(force bool) map[string]any {
 			disabledBy := make(map[string]bool, len(files2))
 			for _, f := range files2 {
 				live[f.AuthIndex] = struct{}{}
+				// Prefer host list Disabled after reconcile; avoids N extra host.auth.get.
+				// Dashboard row load already used hostAuthGetBundle for physical truth.
 				disabledBy[f.AuthIndex] = f.Disabled
-				if phys, perr := hostAuthGetPhysical(f.AuthIndex); perr == nil {
-					disabledBy[f.AuthIndex] = phys.Disabled
-				}
 			}
 			filtered := out[:0]
 			for _, a := range out {
