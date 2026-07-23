@@ -216,7 +216,7 @@ function markTrialDone(btn){
   btn.dataset.orig="已领取";
 }
 function fmtRemain(c){if(!c)return "-";const t=(c.total_remain||0)+(c.total_used||0);return c.total_remain+" 余 / "+t+" 总"}
-function esc(s){return (s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
+function esc(s){return (s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
 function progressHTML(c){
   // total uses size when known; remain = spendable, used = cycle spend.
   // Check-in adds packs → size/remain go UP (grant). Chat spend → used goes UP, remain DOWN.
@@ -243,14 +243,14 @@ function card(a){
     if(a.trial_claimed){
       actionHTML='<button class="done" disabled="disabled">已领取</button>';
     }else{
-      actionHTML=`<button class="sec" onclick="claimTrial('${a.auth_index}',this)">领取专家加油包</button>`;
+      actionHTML=`<button class="sec" onclick="claimTrial('${esc(a.auth_index)}',this)">领取专家加油包</button>`;
     }
   }else{
     const checked=ci.today_checked_in;
     const btnClass=checked?"done":"sec";
     const btnText=checked?"已签到":"签到";
     const btnDisabled=checked?" disabled=\"disabled\"":"";
-    actionHTML=`<button class="${btnClass}" onclick="checkin('${a.auth_index}',this)"${btnDisabled}>${btnText}</button>`;
+    actionHTML=`<button class="${btnClass}" onclick="checkin('${esc(a.auth_index)}',this)"${btnDisabled}>${btnText}</button>`;
   }
   const badges=(disabled?`<span class="badge disabled">已禁用</span>`:"")+(exhausted?`<span class="badge exhausted">耗尽</span>`:"")+regionBadge+`<span class="badge ${plan}">${esc(a.plan||"-")}</span>`;
   return `<div class="card" data-region="${region}">
