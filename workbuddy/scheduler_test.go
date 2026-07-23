@@ -138,12 +138,12 @@ func TestSchedulerPick_CreditsMode_NoCache_StillPicks(t *testing.T) {
 }
 
 func TestSchedulerPick_CreditsMode_SkipsExhausted(t *testing.T) {
-	// wb-exhausted has remain=0, wb-ok has remain=300 → should pick wb-ok.
+	// wb-exhausted has remain=0 used>0, wb-ok has remain=300 → should pick wb-ok.
 	accountCache.Store("wb-exhausted", &accountCacheEntry{
-		credits: &creditsSummary{TotalRemain: 0},
+		credits: &creditsSummary{TotalRemain: 0, TotalUsed: 500, TotalSize: 500},
 	})
 	accountCache.Store("wb-ok", &accountCacheEntry{
-		credits: &creditsSummary{TotalRemain: 300},
+		credits: &creditsSummary{TotalRemain: 300, TotalUsed: 0, TotalSize: 300},
 	})
 	defer func() {
 		accountCache.Delete("wb-exhausted")
@@ -165,5 +165,54 @@ func TestSchedulerPick_CreditsMode_SkipsExhausted(t *testing.T) {
 	resp := parsePickResponse(t, raw)
 	if !resp.Handled || resp.AuthID != "wb-ok" {
 		t.Fatalf("want wb-ok (remain 300 > 0), got %+v", resp)
+	}
+}
+
+func TestSchedulerPick_SkipsDisabledCandidates(t *testing.T) {
+	restore := setSchedulerMode(schedulerModeCredits)
+	defer restore()
+	accountCache.Store("wb-live", &accountCacheEntry{
+		credits: &creditsSummary{TotalRemain: 50},
+	})
+	defer accountCache.Delete("wb-live")
+	raw, err := handleSchedulerPick(mustMarshal(t, pluginapi.SchedulerPickRequest{
+		Provider: providerName,
+		Candidates: []pluginapi.SchedulerAuthCandidate{
+			{ID: "wb-off", Provider: providerName, Status: "disabled"},
+			{ID: "wb-live", Provider: providerName, Status: "active"},
+		},
+	}))
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	resp := parsePickResponse(t, raw)
+	if !resp.Handled || resp.AuthID != "wb-live" {
+		t.Fatalf("want wb-live, got %+v", resp)
+	}
+	// All disabled → defer
+	raw2, err := handleSchedulerPick(mustMarshal(t, pluginapi.SchedulerPickRequest{
+		Provider: providerName,
+		Candidates: []pluginapi.SchedulerAuthCandidate{
+			{ID: "wb-off", Provider: providerName, Status: "disabled", Metadata: map[string]any{"disabled": true}},
+		},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2 := parsePickResponse(t, raw2)
+	if resp2.Handled {
+		t.Fatalf("all disabled should defer, got %+v", resp2)
+	}
+}
+
+func TestCandidateDisabled(t *testing.T) {
+	if !candidateDisabled(pluginapi.SchedulerAuthCandidate{Status: "disabled"}) {
+		t.Fatal("status disabled")
+	}
+	if !candidateDisabled(pluginapi.SchedulerAuthCandidate{Metadata: map[string]any{"disabled": true}}) {
+		t.Fatal("meta disabled")
+	}
+	if candidateDisabled(pluginapi.SchedulerAuthCandidate{Status: "active"}) {
+		t.Fatal("active should not be disabled")
 	}
 }

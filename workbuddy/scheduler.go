@@ -9,6 +9,7 @@ package main
 import (
 	"encoding/json"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -57,12 +58,17 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
 
-	// Collect workbuddy candidates only; skip exhausted accounts when alternatives exist.
+	// Collect workbuddy candidates only; skip disabled/exhausted when alternatives exist.
 	var wbCandidates []pluginapi.SchedulerAuthCandidate
 	for _, c := range req.Candidates {
-		if c.Provider == providerName {
-			wbCandidates = append(wbCandidates, c)
+		if c.Provider != providerName {
+			continue
 		}
+		// Host already marks operator-disabled auths; never re-select them.
+		if candidateDisabled(c) {
+			continue
+		}
+		wbCandidates = append(wbCandidates, c)
 	}
 	if len(wbCandidates) == 0 {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
@@ -103,6 +109,25 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 
 	// Unknown mode → defer.
 	return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
+}
+
+// candidateDisabled reports host-disabled auth from Status/metadata.
+func candidateDisabled(c pluginapi.SchedulerAuthCandidate) bool {
+	st := strings.ToLower(strings.TrimSpace(c.Status))
+	if st == "disabled" {
+		return true
+	}
+	if c.Metadata != nil {
+		if v, ok := c.Metadata["disabled"]; ok {
+			switch t := v.(type) {
+			case bool:
+				return t
+			case string:
+				return strings.EqualFold(strings.TrimSpace(t), "true")
+			}
+		}
+	}
+	return false
 }
 
 // cachedCreditsRemain returns the cached TotalRemain for the given auth ID,
