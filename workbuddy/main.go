@@ -1487,11 +1487,21 @@ func streamHeaders() http.Header {
 // An emit failure (client disconnected → host closed the stream) aborts the
 // pump so we stop reading a dead upstream.
 func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool, requestedModel, upstreamModel, authUID string, started time.Time, authID string) {
+	// Always close the host stream exactly once on every exit path.
+	closed := false
+	closeOnce := func() {
+		if closed {
+			return
+		}
+		closed = true
+		streamClose(streamID)
+	}
+	defer closeOnce()
+
 	resp, err := sharedHTTPClient().Do(httpReq)
 	if err != nil {
 		publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
 		streamEmitError(streamID, fmt.Sprintf("http_error: %v", err))
-		streamClose(streamID)
 		return
 	}
 	defer resp.Body.Close()
@@ -1502,7 +1512,6 @@ func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool, 
 			go reconcileByUID(authUID, resp.StatusCode, string(errPayload))
 		}
 		streamEmitError(streamID, fmt.Sprintf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200)))
-		streamClose(streamID)
 		return
 	}
 	collector := &sseUsageCollector{}
@@ -1522,7 +1531,9 @@ func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool, 
 			cleaned = "data: " + cleaned
 		}
 		if err := streamEmit(streamID, []byte(cleaned)); err != nil {
-			break
+			// Client disconnected / host closed stream — abort; do not report success.
+			publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), true, 0, "stream_emit: "+err.Error())
+			return
 		}
 	}
 	// A mid-stream read failure means the client received a truncated stream:
@@ -1530,12 +1541,10 @@ func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool, 
 	if err := scanner.Err(); err != nil {
 		publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), true, 0, err.Error())
 		streamEmitError(streamID, fmt.Sprintf("upstream stream read error: %v", err))
-		streamClose(streamID)
 		return
 	}
 	publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), false, 0, "")
 	invalidateAccountCredits(authID, authUID)
-	streamClose(streamID)
 }
 
 // collectUpstreamStream is the synchronous fallback (no async stream id): drain
