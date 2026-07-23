@@ -153,7 +153,11 @@ type creditsSummary struct {
 	// TotalSize is the credit capacity/pool (sum of package sizes). remain+used ≈ size.
 	TotalSize int64 `json:"total_size"`
 	// PackCount is number of resource packages included in the aggregate.
-	PackCount int              `json:"pack_count"`
+	PackCount int `json:"pack_count"`
+	// FetchedAt is when this snapshot was taken (RFC3339). Upstream billing lag
+	// can make remain/used look "stuck" for minutes after chat; compare this
+	// timestamp — not only the numbers — when diagnosing frozen credits.
+	FetchedAt string           `json:"fetched_at,omitempty"`
 	Packages  []packageSummary `json:"packages"`
 }
 
@@ -678,6 +682,10 @@ func cachedAccountDetails(authIndex string, sa *storedAuth, force bool) (plan st
 	if v, ok := accountCache.Load(authIndex); ok {
 		prev = v.(*accountCacheEntry)
 		if !force && time.Since(prev.fetched) < accountCacheTTL {
+			// Ensure cached credits still expose when they were fetched.
+			if prev.credits != nil && prev.credits.FetchedAt == "" {
+				prev.credits.FetchedAt = prev.fetched.UTC().Format(time.RFC3339)
+			}
 			return prev.plan, prev.checkin, prev.credits, nil
 		}
 	}
@@ -722,7 +730,12 @@ func cachedAccountDetails(authIndex string, sa *storedAuth, force bool) (plan st
 			plan = prev.plan
 		}
 	}
-	accountCache.Store(authIndex, &accountCacheEntry{checkin: ci, credits: cr, plan: plan, fetched: time.Now()})
+	now := time.Now()
+	if cr != nil {
+		// Stamp snapshot time for panel/API consumers (A-09 observability).
+		cr.FetchedAt = now.UTC().Format(time.RFC3339)
+	}
+	accountCache.Store(authIndex, &accountCacheEntry{checkin: ci, credits: cr, plan: plan, fetched: now})
 	// Soft cap: if map is huge, drop oldest-looking entries beyond bound.
 	pruneAccountCacheSoftCap(accountCacheSoftCap)
 	return plan, ci, cr, errList
