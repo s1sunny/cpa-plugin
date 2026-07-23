@@ -22,6 +22,11 @@ button.sec{background:#262b36;color:var(--fg)}button:disabled{opacity:.5;cursor:
 .badge.pro{background:rgba(255,180,84,.14);color:var(--warn);border:1px solid rgba(255,180,84,.25)}
 .badge.cn{background:rgba(62,207,142,.14);color:var(--ok);border:1px solid rgba(62,207,142,.25)}
 .badge.global{background:rgba(255,180,84,.14);color:var(--warn);border:1px solid rgba(255,180,84,.25)}
+.badge.disabled{background:rgba(139,147,163,.18);color:var(--mut);border:1px solid rgba(139,147,163,.35)}
+.filter-bar{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap}
+.ftag{background:var(--surface);border:1px solid var(--border);color:var(--mut);border-radius:99px;padding:5px 14px;font-size:12px;cursor:pointer;font-weight:600}
+.ftag.active{background:var(--acc);color:#fff;border-color:var(--acc)}
+.ftag .cnt{font-size:10px;opacity:.75;margin-left:4px}
 .row{display:flex;justify-content:space-between;padding:5px 0;border-top:1px dashed var(--border)}
 .row:first-of-type{border-top:0}.k{color:var(--mut)}.v{font-weight:600}
 .v.ok{color:var(--ok)}.v.warn{color:var(--warn)}.v.err{color:var(--err)}
@@ -70,9 +75,9 @@ button .spin{border-color:#fff;border-top-color:transparent}
 <body>
 <div class="wrap">
   <h1>WorkBuddy 账号面板</h1>
-  <div class="sub">积分余额 · 套餐 · 签到状态 · 自动签到（每日 09:00 / 21:00）</div>
+  <div class="sub">积分余额 · CN 每日签到（09:00/21:00）· Global 专家包一次性手动领取 · 耗尽自动关/删</div>
   <div id="authBox" class="card" style="display:none;margin-bottom:16px">
-    <div style="margin-bottom:8px;color:var(--mut)">需要管理密钥（management key）才能访问账号数据。从 CPA 主面板嵌入时会自动获取，无需输入。</div>
+    <div style="margin-bottom:8px;color:var(--mut)">需要管理密钥（management key）才能访问账号数据。从 CPA 主面板嵌入时会自动获取，无需输入。错误密钥请勿连点，避免 IP 封禁。</div>
     <div style="display:flex;gap:8px">
       <input id="keyInput" type="password" placeholder="management key" style="flex:1;background:#0f1115;border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--fg)">
       <button onclick="saveKey()">连接</button>
@@ -82,9 +87,14 @@ button .spin{border-color:#fff;border-top-color:transparent}
     <button class="sec" id="importBtn" onclick="openImportModal()">导入凭证</button>
     <button id="refreshBtn" onclick="load(true,this)">刷新数据</button>
     <button class="sec" onclick="checkinAll(this)">全部签到</button>
-    <button class="sec" onclick="claimTrialAll(this)">全部领取</button>
-    <label class="toggle"><input type="checkbox" id="autoToggle" onchange="toggleAuto(this.checked)"> 自动签到</label>
+    <button class="sec" onclick="claimTrialAll(this)" title="仅 Global · 一次性">全部领取</button>
+    <label class="toggle" title="仅 CN 账号 09:00 / 21:00"><input type="checkbox" id="autoToggle" onchange="toggleAuto(this.checked)"> 自动签到(CN)</label>
     <span class="toggle" id="svtime"></span>
+  </div>
+  <div class="filter-bar" id="filterBar">
+    <button type="button" class="ftag active" data-region="all" onclick="filterRegion('all',this)">全部 <span class="cnt" id="cntAll">0</span></button>
+    <button type="button" class="ftag" data-region="cn" onclick="filterRegion('cn',this)">CN <span class="cnt" id="cntCn">0</span></button>
+    <button type="button" class="ftag" data-region="global" onclick="filterRegion('global',this)">Global <span class="cnt" id="cntGlobal">0</span></button>
   </div>
   <div id="grid" class="grid"><div class="loading">加载中…</div></div>
 </div>
@@ -191,6 +201,7 @@ function card(a){
   const exhausted=!!a.exhausted||(!!cr&&(cr.total_remain||0)===0&&((cr.total_used||0)>0||(cr.packages&&cr.packages.length)));
   const region=a.region||"cn";
   const isGlobal=region==="global";
+  const disabled=!!a.disabled;
   const regionBadge=`<span class="badge ${region}">${isGlobal?"Global":"CN"}</span>`;
   // CN: 签到 button; Global: 领取专家加油包 button (or 已领取 if trial_claimed)
   let actionHTML;
@@ -207,8 +218,8 @@ function card(a){
     const btnDisabled=checked?" disabled=\"disabled\"":"";
     actionHTML=`<button class="${btnClass}" onclick="checkin('${a.auth_index}',this)"${btnDisabled}>${btnText}</button>`;
   }
-  const badges=(exhausted?`<span class="badge exhausted">耗尽</span>`:"")+regionBadge+`<span class="badge ${plan}">${esc(a.plan||"-")}</span>`;
-  return `<div class="card">
+  const badges=(disabled?`<span class="badge disabled">已禁用</span>`:"")+(exhausted?`<span class="badge exhausted">耗尽</span>`:"")+regionBadge+`<span class="badge ${plan}">${esc(a.plan||"-")}</span>`;
+  return `<div class="card" data-region="${region}">
   <h2>${esc(a.nickname||a.label||a.name)} <span style="display:flex;gap:6px;align-items:center">${badges}</span></h2>
   <div class="uid">${esc(a.uid||"")} · ${esc(a.name||"")}</div>
   ${progressHTML(cr)}
@@ -216,14 +227,80 @@ function card(a){
   <div class="actions">${actionHTML}</div>
   </div>`;
 }
+let currentFilter="all";
+let authFailCount=0;
+let authFailUntil=0;
+function filterRegion(region, btn){
+  currentFilter=region||"all";
+  document.querySelectorAll(".ftag").forEach(b=>b.classList.remove("active"));
+  if(btn) btn.classList.add("active");
+  else{
+    document.querySelectorAll(".ftag").forEach(b=>{
+      if(b.dataset.region===currentFilter) b.classList.add("active");
+    });
+  }
+  document.querySelectorAll("#grid .card").forEach(c=>{
+    const r=c.dataset.region||"cn";
+    c.style.display=(currentFilter==="all"||r===currentFilter)?"":"none";
+  });
+}
+function updateFilterCounts(accounts){
+  let cn=0, gl=0;
+  (accounts||[]).forEach(a=>{
+    if((a.region||"cn")==="global") gl++; else cn++;
+  });
+  const elAll=document.getElementById("cntAll");
+  const elCn=document.getElementById("cntCn");
+  const elGl=document.getElementById("cntGlobal");
+  if(elAll) elAll.textContent=String((accounts||[]).length);
+  if(elCn) elCn.textContent=String(cn);
+  if(elGl) elGl.textContent=String(gl);
+}
 async function api(path, opts={}){
   const k=getKey();
+  if(!k){
+    showAuth();
+    throw new Error("需要管理密钥");
+  }
+  if(Date.now()<authFailUntil){
+    throw new Error("认证多次失败，请稍后重试（防 IP 封禁）");
+  }
   const r=await fetch(API+path,{...opts,headers:{...(opts.headers||{}),...authHeaders(k)}});
-  if(r.status===401){sessionStorage.removeItem(SS_KEY);showAuth();throw new Error("management key 无效或缺失")}
+  if(r.status===401){
+    authFailCount++;
+    sessionStorage.removeItem(SS_KEY);
+    showAuth();
+    if(authFailCount>=3){
+      authFailUntil=Date.now()+60000;
+      authFailCount=0;
+      throw new Error("认证多次失败，请检查管理密钥后 60s 再试");
+    }
+    throw new Error("management key 无效或缺失");
+  }
+  if(r.status===403){
+    authFailCount++;
+    let body="";
+    try{body=await r.text()}catch(_){}
+    if(/IP banned|too many failed/i.test(body)){
+      authFailUntil=Date.now()+60000;
+      throw new Error(body.trim()||"IP 被封禁，请稍后再试");
+    }
+    if(authFailCount>=3){
+      authFailUntil=Date.now()+60000;
+      authFailCount=0;
+    }
+    throw new Error(body.trim()||"禁止访问 (403)");
+  }
+  authFailCount=0;
   return r.json();
 }
 async function load(force, btn){
   const g=document.getElementById("grid");
+  if(!getKey()){
+    showAuth();
+    g.innerHTML='<div class="loading">请先填写 management key</div>';
+    return;
+  }
   // 刷新按钮：loading 态 + 右上角 toast。原先 force 路径静默调 /refresh，
   // 成功/失败都无反馈（签到按钮有 toast，刷新没有）。
   if(force){
@@ -244,16 +321,22 @@ async function load(force, btn){
       return;
     }
     const accounts=d.accounts||[];
+    updateFilterCounts(accounts);
     if(!accounts.length){
       g.innerHTML='<div class="loading">暂无 WorkBuddy 账号</div>';
       if(force) toast("数据已刷新", "warn", "暂无 WorkBuddy 账号");
       return;
     }
     g.innerHTML=accounts.map(card).join("");
+    filterRegion(currentFilter, null);
     if(force){
       const errN=accounts.filter(a=>a.error).length;
-      if(errN) toast("数据已刷新", "warn", accounts.length+" 个账号 · "+errN+" 个有错误");
-      else toast("数据已刷新", "ok", accounts.length+" 个账号");
+      const life=(d.lifecycle||[]).length;
+      let extra=accounts.length+" 个账号";
+      if(errN) extra+=" · "+errN+" 个有错误";
+      if(life) extra+=" · 生命周期 "+life+" 项";
+      if(errN) toast("数据已刷新", "warn", extra);
+      else toast("数据已刷新", "ok", extra);
     }
   }catch(e){
     if(force) toast("刷新失败", "err", e.message||String(e));
@@ -363,8 +446,11 @@ document.getElementById("keyInput").addEventListener("keydown",e=>{if(e.key==="E
 document.addEventListener("keydown",e=>{
   if(e.key==="Escape"&&document.getElementById("importModal").classList.contains("show")) closeImportModal();
 });
-if(!getKey())showAuth();
-load(false);
+if(getKey()){
+  load(false);
+}else{
+  showAuth();
+}
 </script>
 </body>
 </html>
