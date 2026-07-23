@@ -327,9 +327,9 @@ func billingCallOnce(sa *storedAuth, path string, body any) (json.RawMessage, er
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	// Upstream 5xx is transient — classify it so billingCall can retry,
-	// and keep the response body snippet for diagnosis.
+	// and keep a redacted response body snippet for diagnosis (A-42).
 	if resp.StatusCode >= 500 {
-		snippet := strings.TrimSpace(string(raw))
+		snippet := strings.TrimSpace(redactSecrets(string(raw)))
 		if len(snippet) > 120 {
 			snippet = snippet[:120]
 		}
@@ -340,7 +340,7 @@ func billingCallOnce(sa *storedAuth, path string, body any) (json.RawMessage, er
 		return nil, fmt.Errorf("parse failed: %w", err)
 	}
 	if env.Code != 0 {
-		return nil, fmt.Errorf("code=%d msg=%s", env.Code, env.Msg)
+		return nil, fmt.Errorf("code=%d msg=%s", env.Code, truncateRedacted(env.Msg, 120))
 	}
 	return env.Data, nil
 }
