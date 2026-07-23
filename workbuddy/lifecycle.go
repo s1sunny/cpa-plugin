@@ -391,20 +391,6 @@ func hostAuthSaveJSON(name string, raw []byte) error {
 	return nil
 }
 
-// writeAuthFileIfSafe best-effort overwrites a workbuddy auth path so the host
-// file watcher re-synthesizes Auth.Disabled from metadata.disabled.
-// CPA host.auth.save upsert may leave in-memory Disabled lagging until resync.
-func writeAuthFileIfSafe(path string, raw []byte) error {
-	path = strings.TrimSpace(path)
-	if !isSafeWorkbuddyAuthPath(path) {
-		return nil
-	}
-	if len(raw) == 0 {
-		return fmt.Errorf("empty auth payload")
-	}
-	return os.WriteFile(path, raw, 0o600)
-}
-
 // lifecycleStateUnchanged avoids redundant saves when note/disabled unchanged.
 var (
 	lifecycleState   sync.Map // auth_index -> lifecycleStateEntry

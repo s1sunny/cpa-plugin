@@ -220,30 +220,22 @@ func TestLabelForAuth(t *testing.T) {
 	}
 }
 
-func TestWriteAuthFileIfSafe(t *testing.T) {
+func TestIsSafeWorkbuddyAuthPath(t *testing.T) {
 	dir := t.TempDir()
-	okPath := filepath.Join(dir, "workbuddy-safe.json")
-	raw := []byte(`{"type":"workbuddy","disabled":true}`)
-	if err := writeAuthFileIfSafe(okPath, raw); err != nil {
-		t.Fatalf("write safe path: %v", err)
+	ok := filepath.Join(dir, "workbuddy-safe.json")
+	if !isSafeWorkbuddyAuthPath(ok) {
+		t.Fatalf("want safe: %s", ok)
 	}
-	got, err := os.ReadFile(okPath)
-	if err != nil {
-		t.Fatal(err)
+	legacy := filepath.Join(dir, "workbuddy.json")
+	if !isSafeWorkbuddyAuthPath(legacy) {
+		t.Fatalf("want legacy safe: %s", legacy)
 	}
-	if string(got) != string(raw) {
-		t.Fatalf("content mismatch: %s", got)
-	}
-	// unsafe name: no-op, no error
 	bad := filepath.Join(dir, "evil.json")
-	if err := writeAuthFileIfSafe(bad, raw); err != nil {
-		t.Fatalf("unsafe should no-op: %v", err)
+	if isSafeWorkbuddyAuthPath(bad) {
+		t.Fatalf("want unsafe: %s", bad)
 	}
-	if _, err := os.Stat(bad); !os.IsNotExist(err) {
-		t.Fatal("unsafe path must not be written")
-	}
-	if err := writeAuthFileIfSafe(okPath, nil); err == nil {
-		t.Fatal("empty payload should error")
+	if isSafeWorkbuddyAuthPath("") {
+		t.Fatal("empty path must be unsafe")
 	}
 }
 
