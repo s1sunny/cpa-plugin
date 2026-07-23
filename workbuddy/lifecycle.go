@@ -779,10 +779,19 @@ func resolveAuthIndex(authID string) string {
 	if err != nil {
 		return ""
 	}
+	// Prefer O(list) name/id match before per-account host.auth.get (A-22).
+	// Multi-account files are workbuddy-<uid>.json; list Name/ID usually carry that.
+	wantName := "workbuddy-" + authID + ".json"
 	for _, f := range files {
 		if f.AuthIndex == authID || f.ID == authID || f.Name == authID {
 			return f.AuthIndex
 		}
+		if listEntryMatchesUID(f, authID, wantName) {
+			return f.AuthIndex
+		}
+	}
+	// Slow path: only when list metadata lacks uid (rare legacy shapes).
+	for _, f := range files {
 		sa, err := hostAuthGet(f.AuthIndex)
 		if err != nil {
 			continue
@@ -812,7 +821,7 @@ func reconcileByUID(uid string, status int, body string) {
 
 // invalidateAccountCredits drops cached credits so the next panel/reconcile
 // fetch hits upstream. Call after a successful chat completion — otherwise a
-// 45s–5m cache makes "used" look frozen while the user is burning credits.
+// short TTL cache makes "used" look frozen while the user is burning credits.
 func invalidateAccountCredits(authID, authUID string) {
 	if authID != "" {
 		accountCache.Delete(authID)
@@ -825,9 +834,24 @@ func invalidateAccountCredits(authID, authUID string) {
 	if err != nil {
 		return
 	}
+	wantName := "workbuddy-" + authUID + ".json"
+	matchedByName := false
 	for _, f := range files {
 		if f.AuthIndex == authID || f.ID == authID || f.Name == authID {
 			accountCache.Delete(f.AuthIndex)
+			continue
+		}
+		if listEntryMatchesUID(f, authUID, wantName) {
+			accountCache.Delete(f.AuthIndex)
+			matchedByName = true
+		}
+	}
+	if matchedByName {
+		return
+	}
+	// Slow path: legacy names without uid in list metadata.
+	for _, f := range files {
+		if f.AuthIndex == authID {
 			continue
 		}
 		sa, err := hostAuthGet(f.AuthIndex)
@@ -838,6 +862,19 @@ func invalidateAccountCredits(authID, authUID string) {
 			accountCache.Delete(f.AuthIndex)
 		}
 	}
+}
+
+// listEntryMatchesUID reports whether host list metadata already encodes the UID
+// (workbuddy-<uid>.json naming). Pure helper for O(list) cache invalidation.
+func listEntryMatchesUID(f pluginapi.HostAuthFileEntry, uid, wantName string) bool {
+	if uid == "" {
+		return false
+	}
+	if strings.EqualFold(f.Name, wantName) || strings.EqualFold(f.ID, wantName) {
+		return true
+	}
+	base := strings.TrimSuffix(f.Name, ".json")
+	return strings.EqualFold(base, "workbuddy-"+uid)
 }
 
 // enrichAuthMetadata builds Metadata map for AuthData (type/logo/note/disabled).

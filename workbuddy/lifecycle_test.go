@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 func TestShouldActOnCredits(t *testing.T) {
@@ -261,5 +263,33 @@ func TestParseDisabledFromAuthJSON_StringTruth(t *testing.T) {
 	// Only JSON boolean true counts; string "true" is false for strict parse.
 	if parseDisabledFromAuthJSON([]byte(`{"disabled":"true"}`)) {
 		t.Fatal("string true should not parse as bool true with current schema")
+	}
+}
+
+func TestListEntryMatchesUID(t *testing.T) {
+	uid := "00e26541-1884-4916-9c26-253a325d64ac"
+	want := "workbuddy-" + uid + ".json"
+	cases := []struct {
+		name string
+		f    pluginapi.HostAuthFileEntry
+		want bool
+	}{
+		{"name exact", pluginapi.HostAuthFileEntry{Name: want}, true},
+		{"id exact", pluginapi.HostAuthFileEntry{ID: want}, true},
+		{"basename id", pluginapi.HostAuthFileEntry{Name: "workbuddy-" + uid}, true},
+		{"case", pluginapi.HostAuthFileEntry{Name: strings.ToUpper(want)}, true},
+		{"other uid", pluginapi.HostAuthFileEntry{Name: "workbuddy-other.json"}, false},
+		{"legacy bare", pluginapi.HostAuthFileEntry{Name: "workbuddy.json"}, false},
+		{"empty uid", pluginapi.HostAuthFileEntry{Name: want}, false},
+	}
+	for _, tc := range cases {
+		u := uid
+		if tc.name == "empty uid" {
+			u = ""
+		}
+		got := listEntryMatchesUID(tc.f, u, want)
+		if got != tc.want {
+			t.Errorf("%s: got %v want %v", tc.name, got, tc.want)
+		}
 	}
 }
