@@ -162,9 +162,15 @@ func displayNote(sa *storedAuth, cr *creditsSummary, disabled bool) string {
 	if cr == nil {
 		parts = append(parts, "积分未知")
 	} else if isCreditsExhausted(cr) {
-		parts = append(parts, fmt.Sprintf("耗尽 · 余 %d", cr.TotalRemain))
+		parts = append(parts, fmt.Sprintf("耗尽 · 余%d 已用%d", cr.TotalRemain, cr.TotalUsed))
 	} else {
-		parts = append(parts, fmt.Sprintf("余 %d · 已用 %d", cr.TotalRemain, cr.TotalUsed))
+		// Show remain as primary (what you can still spend). Used is real cycle spend.
+		// Size (capacity) grows with check-in packs — do not treat size↑ as usage↓.
+		if cr.TotalSize > 0 {
+			parts = append(parts, fmt.Sprintf("余%d 已用%d 池%d", cr.TotalRemain, cr.TotalUsed, cr.TotalSize))
+		} else {
+			parts = append(parts, fmt.Sprintf("余%d 已用%d", cr.TotalRemain, cr.TotalUsed))
+		}
 	}
 	note := strings.Join(parts, " · ")
 	if len(note) > 80 {
@@ -701,6 +707,36 @@ func reconcileByUID(uid string, status int, body string) {
 		return
 	}
 	_, _ = reconcileOneAccount(idx, true)
+}
+
+// invalidateAccountCredits drops cached credits so the next panel/reconcile
+// fetch hits upstream. Call after a successful chat completion — otherwise a
+// 45s–5m cache makes "used" look frozen while the user is burning credits.
+func invalidateAccountCredits(authID, authUID string) {
+	if authID != "" {
+		accountCache.Delete(authID)
+	}
+	if authUID == "" || authUID == authID {
+		return
+	}
+	// Also drop any cache keyed by auth_index that maps to this UID.
+	files, err := hostAuthList()
+	if err != nil {
+		return
+	}
+	for _, f := range files {
+		if f.AuthIndex == authID || f.ID == authID || f.Name == authID {
+			accountCache.Delete(f.AuthIndex)
+			continue
+		}
+		sa, err := hostAuthGet(f.AuthIndex)
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(sa.Account.UID) == authUID {
+			accountCache.Delete(f.AuthIndex)
+		}
+	}
 }
 
 // enrichAuthMetadata builds Metadata map for AuthData (type/logo/note/disabled).

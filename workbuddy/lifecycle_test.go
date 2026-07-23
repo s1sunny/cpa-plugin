@@ -105,12 +105,12 @@ func TestShouldReenableCN(t *testing.T) {
 func TestDisplayNote(t *testing.T) {
 	cn := &storedAuth{Auth: storedTokens{Domain: "www.codebuddy.cn"}}
 	gl := &storedAuth{Auth: storedTokens{Domain: "www.workbuddy.ai"}}
-	note := displayNote(cn, &creditsSummary{TotalRemain: 12, TotalUsed: 8}, false)
-	if !strings.Contains(note, "CN") || !strings.Contains(note, "12") {
+	note := displayNote(cn, &creditsSummary{TotalRemain: 12, TotalUsed: 8, TotalSize: 20}, false)
+	if !strings.Contains(note, "CN") || !strings.Contains(note, "12") || !strings.Contains(note, "8") {
 		t.Fatalf("cn note = %q", note)
 	}
-	note = displayNote(gl, &creditsSummary{TotalRemain: 0, TotalUsed: 250}, false)
-	if !strings.Contains(note, "Global") {
+	note = displayNote(gl, &creditsSummary{TotalRemain: 0, TotalUsed: 250, TotalSize: 250}, false)
+	if !strings.Contains(note, "Global") || !strings.Contains(note, "耗尽") {
 		t.Fatalf("global note = %q", note)
 	}
 	note = displayNote(cn, &creditsSummary{TotalRemain: 0, TotalUsed: 5}, true)

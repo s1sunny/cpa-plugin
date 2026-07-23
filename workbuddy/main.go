@@ -341,7 +341,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.6.1"
+var version = "0.6.2"
 
 func wbRegistration() registration {
 	return registration{
@@ -1381,6 +1381,7 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	publishUsage(req.Model, upstreamModel, authUID, started, usageDetailFromCompletion(completion), false, 0, "")
+	invalidateAccountCredits(req.AuthID, authUID)
 	return okEnvelope(pluginapi.ExecutorResponse{Payload: completion})
 }
 
@@ -1425,6 +1426,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 			return nil, errCollect
 		}
 		publishUsage(req.Model, upstreamModel, authUID, started, collector.detail(), false, 0, "")
+		invalidateAccountCredits(req.AuthID, authUID)
 		return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
 	}
 
@@ -1437,7 +1439,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		return okEnvelope(streamResponse{Headers: headers})
 	}
 	backendHeaders(httpReq, sa)
-	go pumpUpstreamStream(httpReq, req.StreamID, sseFramed, req.Model, upstreamModel, authUID, started)
+	go pumpUpstreamStream(httpReq, req.StreamID, sseFramed, req.Model, upstreamModel, authUID, started, req.AuthID)
 	return okEnvelope(streamResponse{Headers: headers})
 }
 
@@ -1453,7 +1455,7 @@ func streamHeaders() http.Header {
 // emits each cleaned chunk to the host stream. It closes the stream when done.
 // An emit failure (client disconnected → host closed the stream) aborts the
 // pump so we stop reading a dead upstream.
-func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool, requestedModel, upstreamModel, authUID string, started time.Time) {
+func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool, requestedModel, upstreamModel, authUID string, started time.Time, authID string) {
 	resp, err := sharedHTTPClient().Do(httpReq)
 	if err != nil {
 		publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
@@ -1465,8 +1467,6 @@ func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool, 
 	if resp.StatusCode >= 400 {
 		errPayload, _ := io.ReadAll(resp.Body)
 		publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, resp.StatusCode, string(errPayload))
-		// AuthID is not on pump signature — resolve via authUID best-effort from cache is weak.
-		// Re-fetch list matching uid for lifecycle (async).
 		if authUID != "" {
 			go reconcileByUID(authUID, resp.StatusCode, string(errPayload))
 		}
@@ -1503,6 +1503,7 @@ func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool, 
 		return
 	}
 	publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), false, 0, "")
+	invalidateAccountCredits(authID, authUID)
 	streamClose(streamID)
 }
 
