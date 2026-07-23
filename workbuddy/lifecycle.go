@@ -519,7 +519,22 @@ func deleteAuth(authIndex string, sa *storedAuth) error {
 	}
 	path := strings.TrimSpace(phys.Path)
 	if path == "" {
-		// Fallback: disable instead of silent no-op
+		// Try to reconstruct path from peer workbuddy files' directory + canonical name.
+		name := authFileNameFor(sa)
+		if phys.Name != "" && !isLegacyWorkbuddyAuthName(phys.Name) {
+			name = phys.Name
+		} else if strings.TrimSpace(phys.Name) != "" && isLegacyWorkbuddyAuthName(phys.Name) {
+			name = authFileNameFor(sa)
+		}
+		if dir := peerAuthDir(); dir != "" && name != "" {
+			candidate := filepath.Join(dir, name)
+			if isSafeWorkbuddyAuthPath(candidate) {
+				path = candidate
+			}
+		}
+	}
+	if path == "" {
+		// Last resort: disable instead of silent no-op (never invent a random path).
 		note := displayNote(sa, nil, true) + " · 应删除但无 path"
 		raw, berr := buildAuthFileJSON(sa, true, note, nil)
 		if berr != nil {
@@ -539,9 +554,38 @@ func deleteAuth(authIndex string, sa *storedAuth) error {
 	if err := deleteAuthFileAt(path); err != nil {
 		return err
 	}
+	// Also remove legacy workbuddy.json if this UID was dual-named historically.
+	if sa != nil && strings.TrimSpace(sa.Account.UID) != "" {
+		if dir := filepath.Dir(path); dir != "" {
+			legacy := filepath.Join(dir, authFileName)
+			if isSafeWorkbuddyAuthPath(legacy) && isLegacyWorkbuddyAuthName(filepath.Base(legacy)) {
+				_ = os.Remove(legacy)
+			}
+		}
+	}
 	lifecycleState.Delete(authIndex)
 	accountCache.Delete(authIndex)
 	return nil
+}
+
+// peerAuthDir returns the directory of any workbuddy auth file known to the host.
+func peerAuthDir() string {
+	files, err := hostAuthList()
+	if err != nil {
+		return ""
+	}
+	for _, f := range files {
+		phys, err := hostAuthGetPhysical(f.AuthIndex)
+		if err != nil || phys == nil {
+			continue
+		}
+		p := strings.TrimSpace(phys.Path)
+		if p == "" {
+			continue
+		}
+		return filepath.Dir(p)
+	}
+	return ""
 }
 
 // applyExhaustedPolicy applies disable (CN) or delete (Global).
