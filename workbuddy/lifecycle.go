@@ -233,22 +233,16 @@ func resolveAuthFileTarget(sa *storedAuth, phys *hostAuthPhysical) (name, path s
 	return name, path, legacyPath
 }
 
-// hostAuthPersist saves via host API and dual-writes the physical path when known.
-// When migrating off legacy workbuddy.json, saves to the uid-based name and removes the legacy file.
+// hostAuthPersist saves via host API only. Dual-writing the physical path after
+// a successful host.auth.save is redundant (host already WriteFile) and can
+// re-fire the watcher → extra re-parse / transient dual registration risk.
 func hostAuthPersist(name, path string, raw []byte) error {
+	_ = path // reserved for callers that still pass physical path for migrate logic
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return fmt.Errorf("empty auth file name")
 	}
-	if err := hostAuthSaveJSON(name, raw); err != nil {
-		return err
-	}
-	// Dual-write path only when it already is the same basenamed file (watcher nudge).
-	// Never write raw to a different basename than name — that recreates duplicates.
-	if path != "" && strings.EqualFold(filepath.Base(path), name) {
-		_ = writeAuthFileIfSafe(path, raw)
-	}
-	return nil
+	return hostAuthSaveJSON(name, raw)
 }
 
 // hostAuthPersistMigrate is like hostAuthPersist but also removes a legacy path
