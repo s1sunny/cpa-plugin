@@ -84,10 +84,11 @@ make test && make vet && make build VERSION=$(cat VERSION)
 
 | 路径 | 方法 | 说明 |
 |---|---|---|
-| `.../accounts` | GET | 账号 + credits + **exhausted** |
-| `.../refresh` | POST | 强制刷新缓存 |
-| `.../checkin` | POST | 手动签到 |
+| `.../accounts` | GET | 账号 + credits + **exhausted** + **disabled** |
+| `.../refresh` | POST | 强制刷新缓存 + 生命周期 reconcile |
+| `.../checkin` | POST | 手动签到（CN）；签到后 reenable 检查 |
 | `.../checkin/config` | POST | 自动签到开关 |
+| `.../trial` | POST | Global 专家包一次性领取 |
 | `.../credits` | GET | 实时积分 |
 | `.../import` | POST | 导入凭证 `{"json":{...}}` 或 `{"raw":"..."}` |
 
@@ -97,7 +98,7 @@ make test && make vet && make build VERSION=$(cat VERSION)
 
 - **hy3\*** 系列：executor 将 `reasoning_effort` 钉为 `high`（非 ThinkingApplier 能力；见源码 `forceMaxThinking`）
 - **count_tokens**：上游无 API，返回 `{"input_tokens":0}`
-- **checkin_auto / scheduler_mode**：config_yaml 可配；面板 checkin 开关运行时不写回 yaml
+- **checkin_auto / lifecycle_auto / scheduler_mode**：config_yaml 可配；面板 checkin 开关运行时不写回 yaml
 - **host.http.do**：评估结论见 `docs/host-http-evaluation.md`（暂不迁移）
 - **包结构**：同包多文件，不拆 internal（`docs/package-layout.md`）
 
@@ -106,11 +107,12 @@ make test && make vet && make build VERSION=$(cat VERSION)
 | 文件 | 说明 |
 |---|---|
 | `main.go` | ABI / OAuth / executor |
-| `management.go` | 面板 / 签到 / 导入 |
+| `management.go` | 面板 / 签到 / 导入 / tick |
+| `lifecycle.go` | 积分耗尽关/删/再开 |
 | `scheduler.go` | scheduler.pick |
 | `panel.html` | 前端 |
 | `LICENSE` / `VERSION` / `CHANGELOG.md` | 发布元数据 |
-| `.github/workflows/release.yml` | 多架构 Release |
+| `.github/workflows/build.yml` | 多架构 Release |
 
 ---
 
@@ -118,7 +120,7 @@ make test && make vet && make build VERSION=$(cat VERSION)
 
 ### Features
 
-OAuth multi-account provider, dynamic models, production executor (SSE, tools, aliases), usage reporting, daily check-in, credits dashboard with **exhausted** badge, optional **credits scheduler** (`scheduler_mode`, default `off`), credential JSON import.
+OAuth multi-account provider, dynamic models, production executor (SSE, tools, aliases), usage reporting, **CN daily check-in**, **Global one-shot expert trial (manual only)**, **credit lifecycle** (disable CN / delete Global when exhausted; re-enable CN after credits return), credits dashboard with region filters, optional **credits scheduler** (`scheduler_mode`, default `off`), credential JSON import.
 
 ### Install
 
@@ -151,7 +153,8 @@ https://raw.githubusercontent.com/Sliverkiss/cpa-plugin/main/registry.json
 ### Build
 
 ```bash
-make test && make vet && make build VERSION=$(cat VERSION)
+make test && make vet && make build
+# VERSION is read from ./VERSION (override with VERSION=x.y.z)
 ```
 
 Release artifacts are produced by `.github/workflows/build.yml` for linux/darwin/windows/freebsd multi-arch.
@@ -164,11 +167,20 @@ plugins:
     workbuddy:
       enabled: true
       scheduler_mode: off   # or credits
-      checkin_auto: true
+      checkin_auto: true    # CN only
+      lifecycle_auto: true  # disable/delete/reenable on credits
 ```
+
+### Lifecycle
+
+| Region | Exhausted credits | Recovery |
+|--------|-------------------|----------|
+| CN | set `disabled:true` | re-enable after check-in/refresh when remain>0 |
+| Global | **delete auth file** | re-login / re-import |
 
 ### Notes
 
 - hy3\* models force `reasoning_effort=high` in-plugin
 - `count_tokens` stub returns zero input tokens
+- CPAMP Auth page filter icon letter "W" cannot be changed from the plugin (static frontend table); use `note` + WorkBuddy panel
 - See `docs/host-http-evaluation.md` and `docs/package-layout.md`
