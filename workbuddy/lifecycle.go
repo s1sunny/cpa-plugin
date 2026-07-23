@@ -300,10 +300,17 @@ func parseDisabledFromAuthJSON(raw []byte) bool {
 	return m.Disabled
 }
 
-// isSafeWorkbuddyAuthPath rejects non-workbuddy filenames and empty paths.
+// isSafeWorkbuddyAuthPath rejects non-workbuddy filenames, empty paths, and
+// traversal attempts. It validates both the basename pattern AND that the path
+// does not escape via ".." segments. Callers that need to confine deletes to
+// a specific directory should additionally check isPathUnder(path, dir).
 func isSafeWorkbuddyAuthPath(path string) bool {
 	path = strings.TrimSpace(path)
 	if path == "" {
+		return false
+	}
+	// Reject any path containing ".." — prevents traversal regardless of basename.
+	if strings.Contains(filepath.ToSlash(path), "../") || strings.Contains(filepath.ToSlash(path), "/..") {
 		return false
 	}
 	base := filepath.Base(path)
@@ -321,10 +328,48 @@ func isSafeWorkbuddyAuthPath(path string) bool {
 	return true
 }
 
+// isPathUnder reports whether path is inside dir (after cleaning both).
+// Empty dir means "no constraint" (returns true for any safe path).
+func isPathUnder(path, dir string) bool {
+	path = strings.TrimSpace(path)
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return true
+	}
+	cleanPath := filepath.Clean(path)
+	cleanDir := filepath.Clean(dir)
+	if cleanPath == cleanDir {
+		return false // path is the dir itself, not under it
+	}
+	rel, err := filepath.Rel(cleanDir, cleanPath)
+	if err != nil {
+		return false
+	}
+	return rel != "." && !strings.HasPrefix(rel, "..") && !strings.Contains(rel, string(filepath.Separator)+"..")
+}
+
 // deleteAuthFileAt removes a workbuddy auth file. Missing file is success.
+// The path must be safe AND, when dir is non-empty, confined under that dir.
 func deleteAuthFileAt(path string) error {
 	if !isSafeWorkbuddyAuthPath(path) {
 		return fmt.Errorf("refusing to delete unsafe path: %s", path)
+	}
+	err := os.Remove(path)
+	if err != nil && os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
+
+// deleteAuthFileInDir is like deleteAuthFileAt but additionally requires the
+// path to be under dir. Use for lifecycle deletes where the auth directory is
+// known — prevents a malicious/buggy host path from deleting arbitrary files.
+func deleteAuthFileInDir(path, dir string) error {
+	if !isSafeWorkbuddyAuthPath(path) {
+		return fmt.Errorf("refusing to delete unsafe path: %s", path)
+	}
+	if dir != "" && !isPathUnder(path, dir) {
+		return fmt.Errorf("refusing to delete path outside auth dir: %s (dir=%s)", path, dir)
 	}
 	err := os.Remove(path)
 	if err != nil && os.IsNotExist(err) {
@@ -561,7 +606,7 @@ func deleteAuth(authIndex string, sa *storedAuth) error {
 		accountCache.Delete(authIndex)
 		return nil
 	}
-	if err := deleteAuthFileAt(path); err != nil {
+	if err := deleteAuthFileInDir(path, filepath.Dir(path)); err != nil {
 		return err
 	}
 	// Also remove legacy workbuddy.json if this UID was dual-named historically.

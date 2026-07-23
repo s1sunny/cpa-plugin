@@ -239,6 +239,62 @@ func TestIsSafeWorkbuddyAuthPath(t *testing.T) {
 	if isSafeWorkbuddyAuthPath("") {
 		t.Fatal("empty path must be unsafe")
 	}
+	// Traversal: explicit ".." in the raw string before filepath.Join cleans it.
+	if isSafeWorkbuddyAuthPath("/auth/../workbuddy-x.json") {
+		t.Fatal("path with .. must be rejected")
+	}
+	// /etc/workbuddy-evil.json has valid basename but is NOT under auth dir.
+	// isSafeWorkbuddyAuthPath only validates basename + traversal; the
+	// directory confinement is enforced by deleteAuthFileInDir + isPathUnder.
+	// So this path PASSES isSafe (baseline) but must FAIL deleteAuthFileInDir.
+	// (Tested in TestDeleteAuthFileInDir.)
+}
+
+func TestIsPathUnder(t *testing.T) {
+	dir := t.TempDir()
+	ok := filepath.Join(dir, "workbuddy-uid.json")
+	if !isPathUnder(ok, dir) {
+		t.Fatalf("path under dir should pass: %s", ok)
+	}
+	// Sibling dir
+	other := filepath.Join(dir, "..", "other", "workbuddy-uid.json")
+	if isPathUnder(other, dir) {
+		t.Fatalf("path outside dir should fail: %s", other)
+	}
+	// Empty dir = no constraint
+	if !isPathUnder("/anywhere/workbuddy.json", "") {
+		t.Fatal("empty dir should allow")
+	}
+	// Path is dir itself
+	if isPathUnder(dir, dir) {
+		t.Fatal("dir itself is not 'under' dir")
+	}
+}
+
+func TestDeleteAuthFileInDir(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "workbuddy-x.json")
+	if err := os.WriteFile(target, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Delete under correct dir — succeeds.
+	if err := deleteAuthFileInDir(target, dir); err != nil {
+		t.Fatalf("delete in dir: %v", err)
+	}
+	// Delete outside dir — rejected (A-23: basename-only was insufficient).
+	outside := "/etc/workbuddy-evil.json"
+	if err := deleteAuthFileInDir(outside, dir); err == nil {
+		t.Fatal("delete outside dir should fail (A-23)")
+	}
+	// Traversal outside dir
+	traversal := filepath.Join(dir, "..", "workbuddy-evil.json")
+	if err := deleteAuthFileInDir(traversal, dir); err == nil {
+		t.Fatal("delete with .. traversal should fail")
+	}
+	// Unsafe name — rejected.
+	if err := deleteAuthFileInDir(filepath.Join(dir, "evil.json"), dir); err == nil {
+		t.Fatal("unsafe name should fail")
+	}
 }
 
 func TestLifecycleActionFor_IdempotentPolicy(t *testing.T) {
