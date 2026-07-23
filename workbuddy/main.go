@@ -1144,10 +1144,18 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 		// Not a workbuddy credential; let the host try other providers.
 		return okEnvelope(pluginapi.AuthParseResponse{Handled: false})
 	}
-	// CRITICAL: echo back the host-provided FileName (filepath.Base of the on-disk
-	// file). If we override it with "workbuddy-<uid>.json" while the file on disk
-	// is "workbuddy.json" (legacy), CPA computes a different auth ID → duplicate.
+	// CRITICAL: echo back the host-provided FileName AND leave ID empty.
+	//
+	// CPA uses ID for auth record identity (upsert key). If we set ID=uid
+	// while the host's watcher initially registered with ID=filename,
+	// upsertAuthRecord can't find the existing record → creates a NEW one
+	// → duplicate auth entries (same file, different IDs).
+	//
+	// By leaving ID empty, CPA falls back to authIDForPath(path) which
+	// derives ID from the file path → always matches the watcher's key.
+	// FileName is also echoed back to avoid rename-based duplicates.
 	ad := toAuthDataOpts(sa, nil, false)
+	ad.ID = "" // let host compute from path (prevents ID mismatch dupes)
 	if fn := strings.TrimSpace(req.FileName); fn != "" {
 		ad.FileName = fn
 	}
@@ -1305,6 +1313,7 @@ func preserveExpiry(newExpiry, oldExpiry int64) int64 {
 func toAuthDataForRefresh(sa *storedAuth) pluginapi.AuthData {
 	ad := toAuthDataOpts(sa, nil, false)
 	ad.FileName = "" // let host backfill original
+	ad.ID = ""      // let host compute from path (prevents ID mismatch dupes)
 	return ad
 }
 
