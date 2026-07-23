@@ -291,6 +291,10 @@ func TestDeleteAuthFileInDir(t *testing.T) {
 	if err := deleteAuthFileInDir(traversal, dir); err == nil {
 		t.Fatal("delete with .. traversal should fail")
 	}
+	// Relative path — rejected (A-27: CWD deletion hazard).
+	if err := deleteAuthFileInDir("workbuddy-evil.json", ""); err == nil {
+		t.Fatal("relative path should fail (A-27)")
+	}
 	// Unsafe name — rejected.
 	if err := deleteAuthFileInDir(filepath.Join(dir, "evil.json"), dir); err == nil {
 		t.Fatal("unsafe name should fail")

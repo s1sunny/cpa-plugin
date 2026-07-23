@@ -364,9 +364,13 @@ func deleteAuthFileAt(path string) error {
 // deleteAuthFileInDir is like deleteAuthFileAt but additionally requires the
 // path to be under dir. Use for lifecycle deletes where the auth directory is
 // known — prevents a malicious/buggy host path from deleting arbitrary files.
+// The path MUST be absolute (defense against relative-path CWD deletion).
 func deleteAuthFileInDir(path, dir string) error {
 	if !isSafeWorkbuddyAuthPath(path) {
 		return fmt.Errorf("refusing to delete unsafe path: %s", path)
+	}
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("refusing to delete relative path: %s", path)
 	}
 	if dir != "" && !isPathUnder(path, dir) {
 		return fmt.Errorf("refusing to delete path outside auth dir: %s (dir=%s)", path, dir)
