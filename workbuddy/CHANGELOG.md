@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.0
+
+### Added
+- International (Global) WorkBuddy account support (`www.workbuddy.ai` domain)
+- Domain-aware billing API routing: CN accounts → `codebuddy.cn`, Global → `workbuddy.ai`
+- Expert trial pack claim API: `POST /plugins/workbuddy/trial` (Global only, one-time 250 credits / 14 days)
+- Panel region badges: light green `CN` (daily checkin) + light orange `Global` (expert trial)
+- "全部领取" batch claim button for Global accounts
+- Auto-scheduler region branch: CN → daily checkin, Global → claim expert trial if unclaimed
+- `wbAccount.region` and `wbAccount.trial_claimed` fields in accounts API response
+- `hasTrialPack()` helper detects trial pack from `get-user-resource` packages
+
+### Changed
+- `billingBase` selection is now domain-driven via `billingBaseFor(sa)`
+- `backendHeaders` Origin/Referer dynamically set per account domain via `originRefererFor(sa)`
+- Panel card buttons: CN → 签到, Global → 领取专家加油包 / 已领取
+- "全部签到" button only triggers CN accounts (Global accounts are skipped with a message)
+- `runAutoCheckin` branches by region: CN daily checkin, Global trial claim
+
 ## 0.4.3
 
 ### Changed

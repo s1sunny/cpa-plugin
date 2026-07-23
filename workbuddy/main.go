@@ -341,7 +341,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.4.3"
+var version = "0.5.0"
 
 func wbRegistration() registration {
 	return registration{
@@ -1047,6 +1047,16 @@ func commonHeaders(req *http.Request) {
 	req.Header.Set("User-Agent", clientUA)
 }
 
+// originRefererFor returns the Origin/Referer base URL appropriate for the
+// account's domain. Global accounts use https://www.workbuddy.ai; CN (and
+// legacy auth files with empty domain) use the default https://www.codebuddy.cn.
+func originRefererFor(sa *storedAuth) string {
+	if sa != nil && isGlobalDomain(sa.Auth.Domain) {
+		return "https://www.workbuddy.ai"
+	}
+	return originReferer
+}
+
 // backendHeaders applies auth-derived headers to a chat completion request.
 // Empty fields are signalled via the X-No-* convention used by CodeBuddy.
 func backendHeaders(req *http.Request, sa *storedAuth) {
@@ -1075,6 +1085,11 @@ func backendHeaders(req *http.Request, sa *storedAuth) {
 		req.Header.Set("X-No-Department-Info", "1")
 	}
 	req.Header.Set("X-Product", "SaaS")
+	// Override Origin/Referer for Global accounts so the upstream doesn't
+	// reject the request as cross-origin.
+	origin := originRefererFor(sa)
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Referer", origin+"/")
 }
 
 // doJSON sends method to fullURL with the given headers, parses the {code,msg,data}

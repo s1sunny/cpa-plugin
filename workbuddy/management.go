@@ -22,12 +22,49 @@ import (
 // It is a var (not const) so tests can override it with an httptest server.
 var billingBase = "https://www.codebuddy.cn"
 
+// billingBaseGlobal is the international (www.workbuddy.ai) billing base.
+var billingBaseGlobal = "https://www.workbuddy.ai"
+
 // setBillingBase temporarily overrides billingBase for tests; returns a
 // restore func.
 func setBillingBase(s string) func() {
 	old := billingBase
 	billingBase = s
 	return func() { billingBase = old }
+}
+
+// setBillingBaseGlobal temporarily overrides billingBaseGlobal for tests.
+func setBillingBaseGlobal(s string) func() {
+	old := billingBaseGlobal
+	billingBaseGlobal = s
+	return func() { billingBaseGlobal = old }
+}
+
+// isGlobalDomain reports whether the domain belongs to the international
+// (www.workbuddy.ai) WorkBuddy service.  The CN service uses
+// www.codebuddy.cn; Global uses www.workbuddy.ai.
+func isGlobalDomain(domain string) bool {
+	d := strings.ToLower(strings.TrimSpace(domain))
+	return strings.Contains(d, "workbuddy.ai")
+}
+
+// accountRegion returns "cn" or "global" based on the auth's domain field.
+// Empty domain (legacy auth files) defaults to "cn" for backward compat.
+func accountRegion(sa *storedAuth) string {
+	if sa != nil && isGlobalDomain(sa.Auth.Domain) {
+		return "global"
+	}
+	return "cn"
+}
+
+// billingBaseFor returns the billing API base URL for the given auth's domain.
+// CN accounts → https://www.codebuddy.cn; Global → https://www.workbuddy.ai.
+// Falls back to the test-overridable billingBase for CN/nil.
+func billingBaseFor(sa *storedAuth) string {
+	if sa != nil && isGlobalDomain(sa.Auth.Domain) {
+		return billingBaseGlobal
+	}
+	return billingBase
 }
 
 // check-in schedule: 09:00 and 21:00 local time.
@@ -85,11 +122,13 @@ type wbAccount struct {
 	Label      string          `json:"label"`
 	Nickname   string          `json:"nickname"`
 	UID        string          `json:"uid"`
+	Region     string          `json:"region"` // "cn" or "global"
 	Plan       string          `json:"plan"`
 	Status     string          `json:"status"`
 	Exhausted  bool            `json:"exhausted"`
 	Credits    *creditsSummary `json:"credits,omitempty"`
 	Checkin    *checkinSummary `json:"checkin,omitempty"`
+	TrialClaimed bool          `json:"trial_claimed,omitempty"` // Global: expert trial already claimed
 	Error      string          `json:"error,omitempty"`
 }
 
@@ -247,7 +286,8 @@ func billingCallOnce(sa *storedAuth, path string, body any) (json.RawMessage, er
 	} else {
 		reader = bytes.NewReader([]byte("{}"))
 	}
-	req, err := http.NewRequest(http.MethodPost, billingBase+path, reader)
+	base := billingBaseFor(sa)
+	req, err := http.NewRequest(http.MethodPost, base+path, reader)
 	if err != nil {
 		return nil, err
 	}
@@ -451,6 +491,49 @@ func performCheckinCall(sa *storedAuth) (map[string]any, error) {
 	return m, nil
 }
 
+// performTrialCall claims the one-time expert trial pack for a Global account.
+// Endpoint: POST /billing/ide/trial (note: NOT under /v2/billing/meter/).
+// First call: success, +250 credits, 14-day "CodeBuddy One-time Free 2-Week
+// Pro Plan Trial".
+// Repeat call: code=14051 "has applied trial" — surfaced as already_claimed.
+func performTrialCall(sa *storedAuth) (map[string]any, error) {
+	data, err := billingCall(sa, "/billing/ide/trial", nil)
+	if err != nil {
+		msg := err.Error()
+		// code=14051 means the trial has already been claimed — not a real error.
+		if strings.Contains(msg, "14051") {
+			return map[string]any{
+				"success":         false,
+				"message":         "已领取过专家加油包",
+				"already_claimed": true,
+			}, nil
+		}
+		return map[string]any{"success": false, "message": msg}, nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, err
+	}
+	m["success"] = true
+	return m, nil
+}
+
+// hasTrialPack reports whether the credits summary already contains the
+// expert trial pack (one-time, 14-day, 250 credits).  Used to decide whether
+// to offer the "claim trial" button / auto-claim.
+func hasTrialPack(cr *creditsSummary) bool {
+	if cr == nil {
+		return false
+	}
+	for _, p := range cr.Packages {
+		name := strings.ToLower(p.Name)
+		if strings.Contains(name, "trial") || strings.Contains(name, "体验") || strings.Contains(name, "pro plan") {
+			return true
+		}
+	}
+	return false
+}
+
 func jsonBool(m map[string]any, keys ...string) bool {
 	for _, k := range keys {
 		if v, ok := m[k]; ok {
@@ -607,11 +690,15 @@ func buildDashboard(force bool) map[string]any {
 			}
 			acct.Nickname = sa.Account.Nickname
 			acct.UID = sa.Account.UID
+			acct.Region = accountRegion(sa)
 			plan, ci, cr, errs := cachedAccountDetails(f.AuthIndex, sa, force)
 			acct.Plan = plan
 			acct.Checkin = ci
 			acct.Credits = cr
 			acct.Exhausted = isCreditsExhausted(cr)
+			if isGlobalDomain(sa.Auth.Domain) {
+				acct.TrialClaimed = hasTrialPack(cr)
+			}
 			acct.Error = strings.Join(errs, "; ")
 			out[i] = acct
 		}(i, f)
@@ -696,12 +783,23 @@ func runAutoCheckin() {
 		if err != nil {
 			continue
 		}
-		ci, err := fetchCheckinStatus(sa)
-		if err != nil {
-			continue
-		}
-		if ci.Active && !ci.TodayCheckedIn {
-			_, _ = performCheckinCall(sa)
+		if isGlobalDomain(sa.Auth.Domain) {
+			// Global account: auto-claim expert trial pack if not yet claimed.
+			// The trial is one-time (250 credits / 14 days); hasTrialPack prevents
+			// re-calling /billing/ide/trial after a successful claim.
+			cr, err := fetchUserResource(sa)
+			if err == nil && !hasTrialPack(cr) {
+				_, _ = performTrialCall(sa)
+			}
+		} else {
+			// CN account: daily check-in.
+			ci, err := fetchCheckinStatus(sa)
+			if err != nil {
+				continue
+			}
+			if ci.Active && !ci.TodayCheckedIn {
+				_, _ = performCheckinCall(sa)
+			}
 		}
 		// Refresh cache for panel regardless.
 		accountCache.Delete(f.AuthIndex)
@@ -739,6 +837,7 @@ func managementRegistration() managementRegistrationResponse {
 			{Method: http.MethodPost, Path: base + "/checkin/config", Description: "Toggle auto check-in (enabled: true/false)."},
 			{Method: http.MethodGet, Path: base + "/credits", Description: "Get real-time credits for one (auth_index query) or all accounts."},
 			{Method: http.MethodPost, Path: base + "/import", Description: "Import WorkBuddy credential JSON (nested or flat) into host auth store."},
+		{Method: http.MethodPost, Path: base + "/trial", Description: "Claim expert trial pack for one Global account (auth_index). One-time 250 credits / 14 days."},
 		},
 		Resources: []resourceRoute{
 			{Path: "/panel", Menu: "WorkBuddy", Description: "WorkBuddy dashboard: credits, check-in, plan, import."},
@@ -774,6 +873,8 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleCreditsQuery(req)))
 	case req.Method == http.MethodPost && path == base+"/import":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleImportAuth(req)))
+	case req.Method == http.MethodPost && path == base+"/trial":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleClaimTrial(req)))
 	}
 	return okEnvelope(mgmtJSONResponse(http.StatusNotFound, map[string]any{"error": "not found: " + path}))
 }
@@ -821,6 +922,16 @@ func handleManualCheckin(req pluginapi.ManagementRequest) map[string]any {
 		if err != nil {
 			mu.Unlock()
 			results = append(results, map[string]any{"auth_index": f.AuthIndex, "error": err.Error()})
+			continue
+		}
+		// Global accounts don't use daily check-in — they use the expert trial
+		// pack instead.  Skip them in batch/single check-in.
+		if isGlobalDomain(sa.Auth.Domain) {
+			results = append(results, map[string]any{
+				"auth_index": f.AuthIndex, "nickname": sa.Account.Nickname,
+				"success": false, "message": "国际版账号不支持签到，请使用领取专家加油包",
+			})
+			mu.Unlock()
 			continue
 		}
 		ci, _ := fetchCheckinStatus(sa)
@@ -928,6 +1039,47 @@ func handleCheckinConfig(req pluginapi.ManagementRequest) map[string]any {
 	cur := checkinAuto
 	checkinAutoMu.Unlock()
 	return map[string]any{"checkin_auto": cur, "persistent": false}
+}
+
+// handleClaimTrial claims the expert trial pack for one Global account.
+// CN accounts are rejected — the trial endpoint is Global-only.
+func handleClaimTrial(req pluginapi.ManagementRequest) map[string]any {
+	var body struct {
+		AuthIndex string `json:"auth_index"`
+	}
+	_ = json.Unmarshal(req.Body, &body)
+	authIndex := strings.TrimSpace(body.AuthIndex)
+	if authIndex == "" {
+		return map[string]any{"error": "auth_index is required"}
+	}
+	files, err := hostAuthList()
+	if err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	for _, f := range files {
+		if f.AuthIndex != authIndex {
+			continue
+		}
+		sa, err := hostAuthGet(f.AuthIndex)
+		if err != nil {
+			return map[string]any{"auth_index": authIndex, "error": err.Error()}
+		}
+		if !isGlobalDomain(sa.Auth.Domain) {
+			return map[string]any{"auth_index": authIndex, "error": "专家加油包仅适用于国际版账号"}
+		}
+		res, err := performTrialCall(sa)
+		out := map[string]any{"auth_index": authIndex, "nickname": sa.Account.Nickname}
+		if err != nil {
+			out["error"] = err.Error()
+		} else {
+			for k, v := range res {
+				out[k] = v
+			}
+		}
+		accountCache.Delete(authIndex) // refresh cache
+		return out
+	}
+	return map[string]any{"error": "account not found"}
 }
 
 // handleCreditsQuery returns real-time credits for one or all accounts.
