@@ -130,14 +130,6 @@ func candidateDisabled(c pluginapi.SchedulerAuthCandidate) bool {
 	return false
 }
 
-// cachedCreditsRemain returns the cached TotalRemain for the given auth ID,
-// or -1 if no cache entry exists. This is non-blocking: stale cache is fine
-// for scheduler purposes — better to use last-known data than block the pick.
-func cachedCreditsRemain(authID string) int64 {
-	remain, _ := cachedCreditsScore(authID)
-	return remain
-}
-
 // cachedCreditsScore returns (remain, exhausted) from accountCache.
 // remain is -1 when unknown; exhausted uses isCreditsExhausted.
 func cachedCreditsScore(authID string) (int64, bool) {
