@@ -435,7 +435,7 @@ func hostAuthSaveJSON(name string, raw []byte) error {
 	if err := json.Unmarshal(rawResp, &env); err != nil || !env.OK {
 		msg := "host.auth.save failed"
 		if env.Error != nil && env.Error.Message != "" {
-			msg = env.Error.Message
+			msg = truncateRedacted(env.Error.Message, 200)
 		}
 		return fmt.Errorf("%s", msg)
 	}

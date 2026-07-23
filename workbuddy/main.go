@@ -1153,7 +1153,7 @@ func doJSON(client *http.Client, method, fullURL string, headers func(*http.Requ
 		return nil, resp.StatusCode, fmt.Errorf("parse failed: %w", err)
 	}
 	if env.Code != 0 {
-		return nil, resp.StatusCode, fmt.Errorf("code=%d msg=%s", env.Code, env.Msg)
+		return nil, resp.StatusCode, fmt.Errorf("code=%d msg=%s", env.Code, truncateRedacted(env.Msg, 120))
 	}
 	return env.Data, resp.StatusCode, nil
 }
