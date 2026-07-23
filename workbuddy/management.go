@@ -676,7 +676,16 @@ func cachedAccountDetails(authIndex string, sa *storedAuth, force bool) (plan st
 			return prev.plan, prev.checkin, prev.credits, nil
 		}
 	}
-	var wg sync.WaitGroup
+	var (
+		wg      sync.WaitGroup
+		errMu   sync.Mutex
+		errList []string
+	)
+	addErr := func(msg string) {
+		errMu.Lock()
+		errList = append(errList, msg)
+		errMu.Unlock()
+	}
 	wg.Add(3)
 	go func() { defer wg.Done(); plan = fetchPaymentType(sa) }()
 	go func() {
@@ -684,7 +693,7 @@ func cachedAccountDetails(authIndex string, sa *storedAuth, force bool) (plan st
 		if c, err := fetchCheckinStatus(sa); err == nil {
 			ci = c
 		} else {
-			errs = append(errs, "checkin: "+err.Error())
+			addErr("checkin: " + err.Error())
 		}
 	}()
 	go func() {
@@ -692,7 +701,7 @@ func cachedAccountDetails(authIndex string, sa *storedAuth, force bool) (plan st
 		if r, err := fetchUserResource(sa); err == nil {
 			cr = r
 		} else {
-			errs = append(errs, "credits: "+err.Error())
+			addErr("credits: " + err.Error())
 		}
 	}()
 	wg.Wait()
@@ -709,7 +718,50 @@ func cachedAccountDetails(authIndex string, sa *storedAuth, force bool) (plan st
 		}
 	}
 	accountCache.Store(authIndex, &accountCacheEntry{checkin: ci, credits: cr, plan: plan, fetched: time.Now()})
-	return
+	// Soft cap: if map is huge, drop oldest-looking entries beyond bound.
+	pruneAccountCacheSoftCap(accountCacheSoftCap)
+	return plan, ci, cr, errList
+}
+
+// accountCacheSoftCap limits concurrent cache entries (auth churn / index thrash).
+const accountCacheSoftCap = 256
+
+// pruneAccountCacheSoftCap drops excess entries with the oldest fetched time.
+// Called after Store; O(n) over map size — fine for dozens of accounts.
+func pruneAccountCacheSoftCap(capN int) {
+	if capN <= 0 {
+		return
+	}
+	type item struct {
+		key string
+		at  time.Time
+	}
+	var items []item
+	accountCache.Range(func(key, value any) bool {
+		k, _ := key.(string)
+		e, ok := value.(*accountCacheEntry)
+		if !ok || k == "" {
+			accountCache.Delete(key)
+			return true
+		}
+		items = append(items, item{key: k, at: e.fetched})
+		return true
+	})
+	if len(items) <= capN {
+		return
+	}
+	// Sort oldest first
+	for i := 0; i < len(items); i++ {
+		for j := i + 1; j < len(items); j++ {
+			if items[j].at.Before(items[i].at) {
+				items[i], items[j] = items[j], items[i]
+			}
+		}
+	}
+	drop := len(items) - capN
+	for i := 0; i < drop; i++ {
+		accountCache.Delete(items[i].key)
+	}
 }
 
 func buildDashboard(force bool) map[string]any {
