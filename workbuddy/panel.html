@@ -356,17 +356,13 @@ let lastAccounts=[];
 let activeAuthId="";
 let authFailCount=0;
 let authFailUntil=0;
-// Lazy-load: fetch credits for cards that lack them, one at a time with retry.
+// Lazy-load: fetch credits for all cards that lack them, concurrently.
+// Each card fetches independently; failed ones retry once after 2s.
 function lazyLoadCredits(accounts){
   const need=accounts.filter(a=>!a.credits&&!a.error&&!a.disabled);
   if(!need.length) return;
-  let i=0;
-  function fetchOne(){
-    if(i>=need.length) return;
-    const a=need[i++];
+  need.forEach(a=>{
     const idx=a.auth_index;
-    // Update card to show loading spinner (progressHTML already does this
-    // when credits is null). Just ensure the card has data-auth.
     api(`/credits?auth_index=${encodeURIComponent(idx)}`)
       .then(d=>{
         const acct=(d.accounts||[])[0]||d;
@@ -378,25 +374,23 @@ function lazyLoadCredits(accounts){
           if(acct.plan) a.plan=acct.plan;
         }
         if(acct&&acct.error){ a.error=acct.error; }
-        // Re-render this one card.
         updateOneCard(a);
       })
-      .catch(e=>{
-        // Retry once after 2s; if still fails, show error on card.
+      .catch(()=>{
+        // Retry once after 2s.
         setTimeout(()=>{
           api(`/credits?auth_index=${encodeURIComponent(idx)}`)
             .then(d=>{
               const acct=(d.accounts||[])[0]||d;
               if(acct&&acct.credits){ a.credits=acct.credits; a.exhausted=acct.exhausted; }
+              if(acct&&acct.plan) a.plan=acct.plan;
               if(d.error||acct&&acct.error) a.error=d.error||acct.error;
               updateOneCard(a);
             })
-            .catch(()=>{ a.error="积分查询失败"; updateOneCard(a); })
+            .catch(()=>{ a.error="积分查询失败"; updateOneCard(a); });
         },2000);
-      })
-      .finally(()=>{ setTimeout(fetchOne, 300); }); // stagger next card
-  }
-  fetchOne();
+      });
+  });
 }
 function updateOneCard(a){
   const el=document.querySelector(`#grid .card[data-auth="${CSS.escape(a.auth_index)}"]`);
