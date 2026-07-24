@@ -351,7 +351,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.6.21"
+var version = "0.6.22"
 
 func wbRegistration() registration {
 	return registration{
@@ -376,7 +376,7 @@ func wbRegistration() registration {
 			AuthProvider:          true,
 			FrontendAuthProvider:  false,
 			Executor:              true,
-			ExecutorModelScope:    pluginapi.ExecutorModelScopeBoth,
+			ExecutorModelScope:    pluginapi.ExecutorModelScopeOAuth,
 			ExecutorInputFormats:  []string{"chat-completions"},
 			ExecutorOutputFormats: []string{"chat-completions"},
 			ManagementAPI:         true,

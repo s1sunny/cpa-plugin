@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.22
+
+### Fixed
+- ExecutorModelScope 改为 OAuth：插件只处理 workbuddy auth 绑定的模型
+  不再拦截其他 openai-compatible 供应商的同名裸模型（如 deepseek-v4-flash、glm-5.2）
+  修复启用 workbuddy 后自定义供应商模型请求不进监控的问题
+
 ## 0.6.21
 
 ### Fixed
