@@ -351,7 +351,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.6.23"
+var version = "0.6.24"
 
 func wbRegistration() registration {
 	return registration{
@@ -1018,7 +1018,9 @@ func handleModelStatic(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	cacheModelAliases(req.Host)
-	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: fetchDynamicModels()})
+	models := fetchDynamicModels()
+	models = filterExcludedModels(models, req.Host)
+	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: models})
 }
 
 func handleModelForAuth(raw []byte) ([]byte, error) {
@@ -1032,7 +1034,41 @@ func handleModelForAuth(raw []byte) ([]byte, error) {
 	// auth file carries a non-canonical provider string.
 	cacheModelAliases(req.Host)
 	models := fetchDynamicModelsFromStorage(req.StorageJSON)
+	models = filterExcludedModels(models, req.Host)
 	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: models})
+}
+
+// filterExcludedModels removes models listed in oauth-excluded-models for
+// the workbuddy provider. The host passes this config via HostConfigSummary.
+func filterExcludedModels(models []pluginapi.ModelInfo, host pluginapi.HostConfigSummary) []pluginapi.ModelInfo {
+	if len(host.ExcludedModels) == 0 {
+		return models
+	}
+	// Try exact provider match, then case-insensitive scan.
+	excluded := host.ExcludedModels[providerName]
+	if len(excluded) == 0 {
+		for channel, list := range host.ExcludedModels {
+			if strings.EqualFold(strings.TrimSpace(channel), providerName) {
+				excluded = list
+				break
+			}
+		}
+	}
+	if len(excluded) == 0 {
+		return models
+	}
+	excludeSet := make(map[string]struct{}, len(excluded))
+	for _, m := range excluded {
+		excludeSet[strings.ToLower(strings.TrimSpace(m))] = struct{}{}
+	}
+	out := models[:0]
+	for _, m := range models {
+		if _, skip := excludeSet[strings.ToLower(m.ID)]; skip {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 

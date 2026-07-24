@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.24
+
+### Fixed
+- model.static / model.for_auth 现在尊重 CPA 的 oauth-excluded-models 配置
+  在 config.yaml 的 oauth-excluded-models.workbuddy 里列出的模型不再出现在 /models
+
 ## 0.6.23
 
 ### Fixed
