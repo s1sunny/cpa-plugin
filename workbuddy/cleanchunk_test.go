@@ -41,3 +41,55 @@ func TestIsEmptyValueRecursion(t *testing.T) {
 		t.Fatal("map with non-empty value must not be empty")
 	}
 }
+
+func TestCleanChunkStripsNoiseFields(t *testing.T) {
+	in := `{"choices":[{"index":0,"delta":{"content":"hi","extra_fields":null,"refusal":"","reasoning_content":""}}]}`
+	got := cleanChunkJSON(in)
+	if got == "" {
+		t.Fatal("chunk dropped")
+	}
+	for _, noise := range []string{"extra_fields", "refusal", "reasoning_content"} {
+		if strings.Contains(got, noise) {
+			t.Fatalf("noise field %s not stripped: %s", noise, got)
+		}
+	}
+	if !strings.Contains(got, `"content":"hi"`) {
+		t.Fatalf("content lost: %s", got)
+	}
+}
+
+func TestCleanChunk_EmptyOrInvalid(t *testing.T) {
+	if cleanChunkJSON("") != "" {
+		t.Fatal("empty should stay empty")
+	}
+	if cleanChunkJSON("not-json") != "not-json" && cleanChunkJSON("not-json") != "" {
+		// implementation may pass-through or drop; both acceptable if no panic
+	}
+	// purely empty delta object
+	in := `{"choices":[{"index":0,"delta":{}}]}`
+	_ = cleanChunkJSON(in) // must not panic
+}
+
+func TestStripDataPrefix(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"data: hello", "hello"},
+		{"data:hello", "hello"},
+		{"data:  {\"a\":1}", "{\"a\":1}"},
+		{"hello", "hello"},
+		{"", ""},
+		{"DATA: x", "DATA: x"}, // case-sensitive: only lowercase data:
+	}
+	for _, tc := range cases {
+		if got := stripDataPrefix(tc.in); got != tc.want {
+			t.Fatalf("stripDataPrefix(%q)=%q want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestNormalizeTools_NoToolsPassThrough(t *testing.T) {
+	in := []byte(`{"model":"x","messages":[]}`)
+	got := normalizeToolsForUpstream(in)
+	if string(got) != string(in) {
+		t.Fatalf("unexpected rewrite: %s", got)
+	}
+}

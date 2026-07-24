@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -22,12 +24,49 @@ import (
 // It is a var (not const) so tests can override it with an httptest server.
 var billingBase = "https://www.codebuddy.cn"
 
+// billingBaseGlobal is the international (www.workbuddy.ai) billing base.
+var billingBaseGlobal = "https://www.workbuddy.ai"
+
 // setBillingBase temporarily overrides billingBase for tests; returns a
 // restore func.
 func setBillingBase(s string) func() {
 	old := billingBase
 	billingBase = s
 	return func() { billingBase = old }
+}
+
+// setBillingBaseGlobal temporarily overrides billingBaseGlobal for tests.
+func setBillingBaseGlobal(s string) func() {
+	old := billingBaseGlobal
+	billingBaseGlobal = s
+	return func() { billingBaseGlobal = old }
+}
+
+// isGlobalDomain reports whether the domain belongs to the international
+// (www.workbuddy.ai) WorkBuddy service.  The CN service uses
+// www.codebuddy.cn; Global uses www.workbuddy.ai.
+func isGlobalDomain(domain string) bool {
+	d := strings.ToLower(strings.TrimSpace(domain))
+	return d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai")
+}
+
+// accountRegion returns "cn" or "global" based on the auth's domain field.
+// Empty domain (legacy auth files) defaults to "cn" for backward compat.
+func accountRegion(sa *storedAuth) string {
+	if sa != nil && isGlobalDomain(sa.Auth.Domain) {
+		return "global"
+	}
+	return "cn"
+}
+
+// billingBaseFor returns the billing API base URL for the given auth's domain.
+// CN accounts → https://www.codebuddy.cn; Global → https://www.workbuddy.ai.
+// Falls back to the test-overridable billingBase for CN/nil.
+func billingBaseFor(sa *storedAuth) string {
+	if sa != nil && isGlobalDomain(sa.Auth.Domain) {
+		return billingBaseGlobal
+	}
+	return billingBase
 }
 
 // check-in schedule: 09:00 and 21:00 local time.
@@ -37,13 +76,43 @@ var checkinHours = []int{9, 21}
 var (
 	checkinAuto   = true // enabled by default
 	checkinAutoMu sync.RWMutex
+
+	// usageReportURL / usageReportKey: POST NDJSON to CPA-Manager-Plus
+	// /v0/management/usage/import (only path that reaches request monitoring;
+	// c-shared plugins cannot use host usage.DefaultManager/redisqueue).
+	//
+	// Resolution order (community-style, like codex-auth-importer env injection):
+	//  1) plugins.configs.workbuddy.usage_report_* in config.yaml
+	//  2) env USAGE_REPORT_URL / USAGE_REPORT_KEY / CPAMP_ADMIN_KEY
+	//  3) secret files (docker secrets / bind-mount), e.g. /run/secrets/cpamp_admin_key
+	// Default URL targets the compose service name of CPA-Manager-Plus.
+	usageReportURL = defaultUsageReportURL
+	usageReportKey = ""
+	usageReportMu  sync.RWMutex
 )
+
+// Default URL tries localhost first (works for both bare-metal and Docker
+// host-network), falls back to Docker compose service name. The probe runs
+// once at configure() time; a reachable endpoint wins.
+//
+// For users who run CPA Manager Plus on a different host/port, set
+// usage_report_url in plugin config or env USAGE_REPORT_URL.
+const defaultUsageReportURL = "http://127.0.0.1:18317/v0/management/usage/import"
+const fallbackUsageReportURL = "http://cpa-manager-plus:18317/v0/management/usage/import"
 
 // configure decodes plugin config from the lifecycle request.
 func configure(raw []byte) {
 	checkinAutoMu.Lock()
 	defer checkinAutoMu.Unlock()
 	checkinAuto = true
+	lifecycleAutoMu.Lock()
+	lifecycleAuto = true
+	lifecycleAutoMu.Unlock()
+	schedulerModeMu.Lock()
+	defer schedulerModeMu.Unlock()
+	schedulerMode = schedulerModeOff // reset to default on reconfigure
+
+	cfgURL, cfgKey := "", ""
 	if len(raw) > 0 {
 		var req struct {
 			ConfigYAML []byte `json:"config_yaml"`
@@ -55,10 +124,114 @@ func configure(raw []byte) {
 					v := strings.TrimSpace(strings.TrimPrefix(line, "checkin_auto:"))
 					checkinAuto = v == "true" || v == "1" || v == "yes" || v == "on"
 				}
+				if strings.HasPrefix(line, "lifecycle_auto:") {
+					v := strings.TrimSpace(strings.TrimPrefix(line, "lifecycle_auto:"))
+					v = strings.Trim(v, "\"'")
+					lifecycleAutoMu.Lock()
+					lifecycleAuto = v == "true" || v == "1" || v == "yes" || v == "on"
+					lifecycleAutoMu.Unlock()
+				}
+				if strings.HasPrefix(line, "scheduler_mode:") {
+					v := strings.TrimSpace(strings.TrimPrefix(line, "scheduler_mode:"))
+					// Strip surrounding quotes if present.
+					v = strings.Trim(v, "\"'")
+					if v == schedulerModeCredits {
+						schedulerMode = schedulerModeCredits
+					} else {
+						schedulerMode = schedulerModeOff
+					}
+				}
+				if strings.HasPrefix(line, "usage_report_url:") {
+					v := strings.TrimSpace(strings.TrimPrefix(line, "usage_report_url:"))
+					cfgURL = strings.Trim(v, "\"'")
+				}
+				if strings.HasPrefix(line, "usage_report_key:") {
+					v := strings.TrimSpace(strings.TrimPrefix(line, "usage_report_key:"))
+					cfgKey = strings.Trim(v, "\"'")
+				}
 			}
 		}
 	}
+	resolveUsageReport(cfgURL, cfgKey)
 	ensureScheduler()
+}
+
+// resolveUsageReport fills usageReportURL/key from config → env → secret files.
+// Mirrors community plugins that inject management keys via env/build (e.g.
+// codex-auth-importer CODEX_AUTH_IMPORTER_MANAGEMENT_KEY), not plaintext CPA
+// remote-management.secret-key (that field is bcrypt-hashed).
+func resolveUsageReport(cfgURL, cfgKey string) {
+	url := firstNonEmpty(
+		strings.TrimSpace(cfgURL),
+		strings.TrimSpace(os.Getenv("USAGE_REPORT_URL")),
+		strings.TrimSpace(os.Getenv("CPAMP_USAGE_IMPORT_URL")),
+	)
+	if url == "" {
+		url = probeUsageReportURL()
+	}
+	key := firstNonEmpty(
+		strings.TrimSpace(cfgKey),
+		strings.TrimSpace(os.Getenv("USAGE_REPORT_KEY")),
+		strings.TrimSpace(os.Getenv("CPAMP_ADMIN_KEY")),
+		strings.TrimSpace(os.Getenv("CPA_MANAGER_ADMIN_KEY")),
+		readSecretFile(os.Getenv("USAGE_REPORT_KEY_FILE")),
+		readSecretFile(os.Getenv("CPAMP_ADMIN_KEY_FILE")),
+		readSecretFile(os.Getenv("CPA_MANAGER_ADMIN_KEY_FILE")),
+		// docker compose secrets default path
+		readSecretFile("/run/secrets/cpamp_admin_key"),
+		readSecretFile("/run/secrets/cpamp-admin-key"),
+		// optional bind-mounts used on this host
+		readSecretFile("/CLIProxyAPI/secrets/cpamp-admin-key"),
+		readSecretFile("/CLIProxyAPI/secrets/cpamp_admin_key"),
+	)
+	usageReportMu.Lock()
+	usageReportURL = url
+	usageReportKey = key
+	usageReportMu.Unlock()
+}
+
+// probeUsageReportURL tries localhost first (bare-metal + Docker host-network),
+// then Docker compose service name. Returns whichever responds; defaults to
+// localhost if both fail (better to try localhost than an unreachable hostname).
+func probeUsageReportURL() string {
+	for _, candidate := range []string{defaultUsageReportURL, fallbackUsageReportURL} {
+		if probeURL(candidate, 2*time.Second) {
+			return candidate
+		}
+	}
+	return defaultUsageReportURL
+}
+
+// probeURL does a quick HEAD/GET to check if the endpoint is reachable.
+func probeURL(target string, timeout time.Duration) bool {
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Get(target)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	// Any HTTP response (even 401) means the endpoint is reachable;
+	// connection refused / DNS failure means not reachable.
+	return resp.StatusCode > 0
+}
+
+func readSecretFile(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// usageReportConfigured reports whether request-monitoring export is ready.
+func usageReportConfigured() bool {
+	usageReportMu.RLock()
+	defer usageReportMu.RUnlock()
+	return strings.TrimSpace(usageReportURL) != "" && strings.TrimSpace(usageReportKey) != ""
 }
 
 // -----------------------------------------------------------------------------
@@ -67,28 +240,62 @@ func configure(raw []byte) {
 
 // wbAccount is one row of the dashboard.
 type wbAccount struct {
-	AuthIndex string          `json:"auth_index"`
-	Name      string          `json:"name"`
-	Label     string          `json:"label"`
-	Nickname  string          `json:"nickname"`
-	UID       string          `json:"uid"`
-	Plan      string          `json:"plan"`
-	Status    string          `json:"status"`
-	Credits   *creditsSummary `json:"credits,omitempty"`
-	Checkin   *checkinSummary `json:"checkin,omitempty"`
-	Error     string          `json:"error,omitempty"`
+	AuthIndex    string          `json:"auth_index"`
+	Name         string          `json:"name"`
+	Label        string          `json:"label"`
+	Nickname     string          `json:"nickname"`
+	UID          string          `json:"uid"`
+	Region       string          `json:"region"` // "cn" or "global"
+	Plan         string          `json:"plan"`
+	Status       string          `json:"status"`
+	Disabled     bool            `json:"disabled"`
+	Exhausted    bool            `json:"exhausted"`
+	Selected     bool            `json:"selected"` // panel active routing card
+	Credits      *creditsSummary `json:"credits,omitempty"`
+	Checkin      *checkinSummary `json:"checkin,omitempty"`
+	TrialClaimed bool            `json:"trial_claimed,omitempty"` // Global: expert trial already claimed
+	Error        string          `json:"error,omitempty"`
 }
 
 type creditsSummary struct {
-	TotalRemain int64            `json:"total_remain"`
-	TotalUsed   int64            `json:"total_used"`
-	Packages    []packageSummary `json:"packages"`
+	// TotalRemain is currently usable credits across all active packages.
+	TotalRemain int64 `json:"total_remain"`
+	// TotalUsed is consumed credits in the current cycle (sum of packages).
+	TotalUsed int64 `json:"total_used"`
+	// TotalSize is the credit capacity/pool (sum of package sizes). remain+used ≈ size.
+	TotalSize int64 `json:"total_size"`
+	// PackCount is number of resource packages included in the aggregate.
+	PackCount int `json:"pack_count"`
+	// FetchedAt is when this snapshot was taken (RFC3339). Upstream billing lag
+	// can make remain/used look "stuck" for minutes after chat; compare this
+	// timestamp — not only the numbers — when diagnosing frozen credits.
+	FetchedAt string           `json:"fetched_at,omitempty"`
+	Packages  []packageSummary `json:"packages"`
+}
+
+// isCreditsExhausted is the shared "耗尽" definition for panel + scheduler.
+// Exhausted = we have usage signal and no remaining credits.
+// Missing credits data is NOT exhausted (unknown).
+func isCreditsExhausted(cr *creditsSummary) bool {
+	if cr == nil {
+		return false
+	}
+	if cr.TotalRemain > 0 {
+		return false
+	}
+	// remain==0: exhausted only when we know there was/is a package total
+	// (used>0, size>0, or packages present). Pure zero with no packages = no data.
+	if cr.TotalUsed > 0 || cr.TotalSize > 0 {
+		return true
+	}
+	return len(cr.Packages) > 0
 }
 
 type packageSummary struct {
 	Name       string `json:"name"`
 	Remain     int64  `json:"remain"`
 	Used       int64  `json:"used"`
+	Size       int64  `json:"size"`
 	CycleStart string `json:"cycle_start"`
 	CycleEnd   string `json:"cycle_end"`
 }
@@ -143,20 +350,25 @@ func hostAuthList() ([]pluginapi.HostAuthFileEntry, error) {
 
 // hostAuthGet fetches the credential JSON for one auth index.
 func hostAuthGet(authIndex string) (*storedAuth, error) {
-	body, _ := json.Marshal(map[string]string{"auth_index": authIndex})
-	raw, err := hostCall(pluginabi.MethodHostAuthGet, body)
+	phys, err := hostAuthGetPhysical(authIndex)
 	if err != nil {
 		return nil, err
 	}
-	var env envelope
-	if err := json.Unmarshal(raw, &env); err != nil || !env.OK {
-		return nil, fmt.Errorf("host.auth.get: bad envelope")
+	return parseStored(phys.JSON)
+}
+
+// hostAuthGetBundle is one host.auth.get for both storage and physical metadata
+// (avoids the previous double-RPC in dashboard: get + getPhysical).
+func hostAuthGetBundle(authIndex string) (*storedAuth, *hostAuthPhysical, error) {
+	phys, err := hostAuthGetPhysical(authIndex)
+	if err != nil {
+		return nil, nil, err
 	}
-	var resp rpcHostAuthGetResponse
-	if err := json.Unmarshal(env.Result, &resp); err != nil {
-		return nil, err
+	sa, err := parseStored(phys.JSON)
+	if err != nil {
+		return nil, phys, err
 	}
-	return parseStored(resp.JSON)
+	return sa, phys, nil
 }
 
 // -----------------------------------------------------------------------------
@@ -215,7 +427,8 @@ func billingCallOnce(sa *storedAuth, path string, body any) (json.RawMessage, er
 	} else {
 		reader = bytes.NewReader([]byte("{}"))
 	}
-	req, err := http.NewRequest(http.MethodPost, billingBase+path, reader)
+	base := billingBaseFor(sa)
+	req, err := http.NewRequest(http.MethodPost, base+path, reader)
 	if err != nil {
 		return nil, err
 	}
@@ -227,9 +440,9 @@ func billingCallOnce(sa *storedAuth, path string, body any) (json.RawMessage, er
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	// Upstream 5xx is transient — classify it so billingCall can retry,
-	// and keep the response body snippet for diagnosis.
+	// and keep a redacted response body snippet for diagnosis (A-42).
 	if resp.StatusCode >= 500 {
-		snippet := strings.TrimSpace(string(raw))
+		snippet := strings.TrimSpace(redactSecrets(string(raw)))
 		if len(snippet) > 120 {
 			snippet = snippet[:120]
 		}
@@ -240,7 +453,7 @@ func billingCallOnce(sa *storedAuth, path string, body any) (json.RawMessage, er
 		return nil, fmt.Errorf("parse failed: %w", err)
 	}
 	if env.Code != 0 {
-		return nil, fmt.Errorf("code=%d msg=%s", env.Code, env.Msg)
+		return nil, fmt.Errorf("code=%d msg=%s", env.Code, truncateRedacted(env.Msg, 120))
 	}
 	return env.Data, nil
 }
@@ -310,34 +523,70 @@ type resourcePackage struct {
 	CycleEndTime        string `json:"CycleEndTime"`
 }
 
-// packageRemainUsed picks current-cycle remain/used for one package.
-// Prefer cycle metrics whenever CycleCapacitySize is present; compute used as
-// size−remain so missing CycleCapacityUsed never under-reports consumption.
+// packageRemainUsed picks current-cycle remain/used/size for one package.
+// Prefer cycle metrics whenever CycleCapacitySize is present; used = size−remain
+// so missing CycleCapacityUsed never under-reports consumption.
 // Fall back to lifetime Capacity* only when cycle fields are absent entirely.
-func packageRemainUsed(a resourcePackage) (remain, used int64) {
+//
+// Daily check-in adds NEW packages (size grows) — capacity grant, not negative
+// consumption. Track consumption via used (size−remain), not via remain alone.
+func packageRemainUsed(a resourcePackage) (remain, used, size int64) {
 	if a.CycleCapacitySize > 0 {
 		remain = a.CycleCapacityRemain
-		used = a.CycleCapacitySize - a.CycleCapacityRemain
-		if used < 0 {
-			used = 0
+		size = a.CycleCapacitySize
+		if remain < 0 {
+			remain = 0
 		}
-		// Prefer explicit CycleCapacityUsed when it is larger (defensive).
+		if remain > size {
+			remain = size
+		}
+		used = size - remain
+		// If upstream reports a higher explicit used, trust the larger figure.
 		if a.CycleCapacityUsed > used {
 			used = a.CycleCapacityUsed
+			// Keep remain consistent when possible.
+			if size >= used {
+				remain = size - used
+			}
 		}
-		return remain, used
+		return remain, used, size
 	}
 	if a.CycleCapacityRemain > 0 || a.CycleCapacityUsed > 0 {
 		remain = a.CycleCapacityRemain
 		used = a.CycleCapacityUsed
-		return remain, used
+		// A-41: clamp negatives (branch1 already clamps; branch2/3 did not).
+		if remain < 0 {
+			remain = 0
+		}
+		if used < 0 {
+			used = 0
+		}
+		size = remain + used
+		if a.CapacitySize > size {
+			size = a.CapacitySize
+			if size >= remain {
+				used = size - remain
+			}
+		}
+		return remain, used, size
 	}
 	remain = a.CapacityRemain
 	used = a.CapacityUsed
-	if used == 0 && a.CapacitySize > remain && remain >= 0 {
-		used = a.CapacitySize - remain
+	size = a.CapacitySize
+	// A-41: lifetime branch also clamps negative remain/used.
+	if remain < 0 {
+		remain = 0
 	}
-	return remain, used
+	if used < 0 {
+		used = 0
+	}
+	if size <= 0 {
+		size = remain + used
+	}
+	if used == 0 && size > remain {
+		used = size - remain
+	}
+	return remain, used, size
 }
 
 func fetchUserResource(sa *storedAuth) (*creditsSummary, error) {
@@ -361,31 +610,57 @@ func fetchUserResource(sa *storedAuth) (*creditsSummary, error) {
 	var resp struct {
 		Response struct {
 			Data struct {
-				TotalCount int64             `json:"TotalCount"`
-				Accounts   []resourcePackage `json:"Accounts"`
+				TotalCount  int64             `json:"TotalCount"`
+				TotalDosage int64             `json:"TotalDosage"` // package capacity pool, NOT consumption
+				Accounts    []resourcePackage `json:"Accounts"`
 			} `json:"Data"`
 		} `json:"Response"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return nil, err
 	}
-	// Aggregate ALL packages (体验版 + 多个裂变包 + 其它赠送包) into one
-	// account-level remain/used total. Per-package rows are kept for the panel.
+	// Aggregate ALL packages (体验版 + 多个签到/裂变包 + 其它赠送包).
+	// Remain = currently spendable. Used = consumed this cycle. Size = capacity.
+	// Daily check-in adds packages → Size and Remain go UP; that is grant, not usage.
 	sum := &creditsSummary{}
 	for _, a := range resp.Response.Data.Accounts {
-		remain, used := packageRemainUsed(a)
+		remain, used, size := packageRemainUsed(a)
 		sum.TotalRemain += remain
 		sum.TotalUsed += used
+		sum.TotalSize += size
 		sum.Packages = append(sum.Packages, packageSummary{
 			Name:       a.PackageName,
 			Remain:     remain,
 			Used:       used,
+			Size:       size,
 			CycleStart: a.CycleStartTime,
 			CycleEnd:   a.CycleEndTime,
 		})
 	}
-	// Soft note: if TotalCount > returned rows, pagination would be needed.
-	// Current free accounts have 3–4 packs; pageSize=100 is ample.
+	sum.PackCount = len(sum.Packages)
+	// Reconcile used with size-remain so UI totals always add up when size known.
+	if sum.TotalSize > 0 {
+		derived := sum.TotalSize - sum.TotalRemain
+		if derived < 0 {
+			derived = 0
+		}
+		// Prefer the larger of reported-used vs size-remain (never under-report spend).
+		if derived > sum.TotalUsed {
+			sum.TotalUsed = derived
+		}
+	}
+	// Upstream TotalDosage is the capacity pool (~sum of package sizes), not spend.
+	// Use it only as a size floor when pack sizes look incomplete.
+	if dosage := resp.Response.Data.TotalDosage; dosage > sum.TotalSize {
+		sum.TotalSize = dosage
+		derived := sum.TotalSize - sum.TotalRemain
+		if derived < 0 {
+			derived = 0
+		}
+		if derived > sum.TotalUsed {
+			sum.TotalUsed = derived
+		}
+	}
 	_ = resp.Response.Data.TotalCount
 	return sum, nil
 }
@@ -417,6 +692,65 @@ func performCheckinCall(sa *storedAuth) (map[string]any, error) {
 		return nil, err
 	}
 	return m, nil
+}
+
+// performTrialCall claims the one-time expert trial pack for a Global account.
+// Endpoint: POST /billing/ide/trial (note: NOT under /v2/billing/meter/).
+// First call: success, +250 credits, 14-day "CodeBuddy One-time Free 2-Week
+// Pro Plan Trial".
+// Repeat call: code=14051 "has applied trial" — surfaced as already_claimed.
+func performTrialCall(sa *storedAuth) (map[string]any, error) {
+	data, err := billingCall(sa, "/billing/ide/trial", nil)
+	if err != nil {
+		msg := err.Error()
+		// code=14051 means the trial has already been claimed — not a real error.
+		if strings.Contains(msg, "14051") {
+			return map[string]any{
+				"success":         false,
+				"message":         "已领取过专家加油包",
+				"already_claimed": true,
+			}, nil
+		}
+		return map[string]any{"success": false, "message": msg}, nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, err
+	}
+	m["success"] = true
+	return m, nil
+}
+
+// hasTrialPack reports whether the credits summary already contains the
+// Global expert trial pack (one-time, 14-day, 250 credits). Used for the
+// panel "claim trial" button state (trial_claimed).
+//
+// Do NOT match bare Chinese "体验": CN free-tier is literally named
+// "CodeBuddy个人体验版" / "体验版" and must remain unclaimed-looking for Global
+// trial UI (A-18). Prefer English trial markers from live Global packs.
+func hasTrialPack(cr *creditsSummary) bool {
+	if cr == nil {
+		return false
+	}
+	for _, p := range cr.Packages {
+		name := strings.ToLower(strings.TrimSpace(p.Name))
+		if name == "" {
+			continue
+		}
+		// Live Global: "CodeBuddy One-time Free 2-Week Pro Plan Trial"
+		if strings.Contains(name, "trial") {
+			return true
+		}
+		// Alternate English shapes (keep without bare "体验")
+		if strings.Contains(name, "pro plan") && (strings.Contains(name, "free") || strings.Contains(name, "one-time") || strings.Contains(name, "2-week") || strings.Contains(name, "2 week")) {
+			return true
+		}
+		// Explicit expert-pack Chinese labels only — never bare 体验/体验版.
+		if strings.Contains(name, "专家加油") || strings.Contains(name, "专家体验包") {
+			return true
+		}
+	}
+	return false
 }
 
 func jsonBool(m map[string]any, keys ...string) bool {
@@ -466,8 +800,8 @@ func jsonStr(m map[string]any, keys ...string) string {
 // Dashboard assembly + caches
 // -----------------------------------------------------------------------------
 
-// accountCache caches per-account checkin/credits/plan results for 5 minutes.
-// Entry doubles as last-known-good snapshot: when a refresh partially fails,
+// accountCache caches per-account checkin/credits/plan results for accountCacheTTL
+// (45s). Entry doubles as last-known-good snapshot: when a refresh partially fails,
 // the failed field falls back to the previous value instead of being wiped.
 type accountCacheEntry struct {
 	checkin *checkinSummary
@@ -478,7 +812,7 @@ type accountCacheEntry struct {
 
 var (
 	accountCache    sync.Map // auth_index -> *accountCacheEntry
-	accountCacheTTL = 5 * time.Minute
+	accountCacheTTL = 45 * time.Second
 )
 
 // cachedAccountDetails fetches plan/checkin/credits concurrently (upstream
@@ -490,10 +824,23 @@ func cachedAccountDetails(authIndex string, sa *storedAuth, force bool) (plan st
 	if v, ok := accountCache.Load(authIndex); ok {
 		prev = v.(*accountCacheEntry)
 		if !force && time.Since(prev.fetched) < accountCacheTTL {
+			// Return cached values. Do NOT mutate prev.credits here — concurrent
+			// goroutines (reconcileOneAccount) may read the same entry.
+			// FetchedAt is stamped at Store time; if it's empty (legacy entry),
+			// the panel can derive it from prev.fetched if needed.
 			return prev.plan, prev.checkin, prev.credits, nil
 		}
 	}
-	var wg sync.WaitGroup
+	var (
+		wg      sync.WaitGroup
+		errMu   sync.Mutex
+		errList []string
+	)
+	addErr := func(msg string) {
+		errMu.Lock()
+		errList = append(errList, msg)
+		errMu.Unlock()
+	}
 	wg.Add(3)
 	go func() { defer wg.Done(); plan = fetchPaymentType(sa) }()
 	go func() {
@@ -501,7 +848,7 @@ func cachedAccountDetails(authIndex string, sa *storedAuth, force bool) (plan st
 		if c, err := fetchCheckinStatus(sa); err == nil {
 			ci = c
 		} else {
-			errs = append(errs, "checkin: "+err.Error())
+			addErr("checkin: " + err.Error())
 		}
 	}()
 	go func() {
@@ -509,7 +856,7 @@ func cachedAccountDetails(authIndex string, sa *storedAuth, force bool) (plan st
 		if r, err := fetchUserResource(sa); err == nil {
 			cr = r
 		} else {
-			errs = append(errs, "credits: "+err.Error())
+			addErr("credits: " + err.Error())
 		}
 	}()
 	wg.Wait()
@@ -525,11 +872,68 @@ func cachedAccountDetails(authIndex string, sa *storedAuth, force bool) (plan st
 			plan = prev.plan
 		}
 	}
-	accountCache.Store(authIndex, &accountCacheEntry{checkin: ci, credits: cr, plan: plan, fetched: time.Now()})
-	return
+	now := time.Now()
+	if cr != nil {
+		// Stamp snapshot time for panel/API consumers (A-09 observability).
+		cr.FetchedAt = now.UTC().Format(time.RFC3339)
+	}
+	accountCache.Store(authIndex, &accountCacheEntry{checkin: ci, credits: cr, plan: plan, fetched: now})
+	// Soft cap: if map is huge, drop oldest-looking entries beyond bound.
+	pruneAccountCacheSoftCap(accountCacheSoftCap)
+	return plan, ci, cr, errList
+}
+
+// accountCacheSoftCap limits concurrent cache entries (auth churn / index thrash).
+const accountCacheSoftCap = 256
+
+// pruneAccountCacheSoftCap drops excess entries with the oldest fetched time.
+// Called after Store; O(n) over map size — fine for dozens of accounts.
+func pruneAccountCacheSoftCap(capN int) {
+	if capN <= 0 {
+		return
+	}
+	type item struct {
+		key string
+		at  time.Time
+	}
+	var items []item
+	accountCache.Range(func(key, value any) bool {
+		k, _ := key.(string)
+		e, ok := value.(*accountCacheEntry)
+		if !ok || k == "" {
+			accountCache.Delete(key)
+			return true
+		}
+		items = append(items, item{key: k, at: e.fetched})
+		return true
+	})
+	if len(items) <= capN {
+		return
+	}
+	// Sort oldest first
+	for i := 0; i < len(items); i++ {
+		for j := i + 1; j < len(items); j++ {
+			if items[j].at.Before(items[i].at) {
+				items[i], items[j] = items[j], items[i]
+			}
+		}
+	}
+	drop := len(items) - capN
+	for i := 0; i < drop; i++ {
+		accountCache.Delete(items[i].key)
+	}
 }
 
 func buildDashboard(force bool) map[string]any {
+	return buildDashboardEx(force, true)
+}
+
+// buildDashboardEx builds the account dashboard. When fetchCredits is false,
+// credits/checkin/plan fields are left empty — the panel renders skeletons
+// and fetches them lazily via /credits?auth_index=<idx>. This avoids hitting
+// upstream billing APIs for all accounts simultaneously on page load (which
+// causes 500 from rate-limited /v2/billing/meter/get-user-resource).
+func buildDashboardEx(force, fetchCredits bool) map[string]any {
 	files, err := hostAuthList()
 	if err != nil {
 		return map[string]any{"error": err.Error()}
@@ -545,6 +949,8 @@ func buildDashboard(force bool) map[string]any {
 		idx, _ := key.(string)
 		if _, ok := live[idx]; !ok {
 			accountCache.Delete(key)
+			checkinLocks.Delete(key)
+			lifecycleState.Delete(key)
 			return true
 		}
 		if e, ok := value.(*accountCacheEntry); ok && time.Since(e.fetched) > 4*accountCacheTTL {
@@ -552,6 +958,9 @@ func buildDashboard(force bool) map[string]any {
 		}
 		return true
 	})
+	// Also prune stale lifecycle state and checkin locks for gone accounts.
+	pruneLifecycleState()
+	pruneCheckinLocks()
 	out := make([]wbAccount, len(files))
 	// Accounts are independent — fetch their dashboards concurrently. With 4
 	// accounts this cuts cold-load latency from ~4×(3 serial upstream calls)
@@ -566,32 +975,176 @@ func buildDashboard(force bool) map[string]any {
 				Name:      f.Name,
 				Label:     f.Label,
 				Status:    f.Status,
+				Disabled:  f.Disabled,
 			}
-			sa, err := hostAuthGet(f.AuthIndex)
+			sa, phys, err := hostAuthGetBundle(f.AuthIndex)
 			if err != nil {
 				acct.Error = "load auth: " + err.Error()
 				out[i] = acct
 				return
 			}
+			// Physical file is source of truth for disabled (host list may lag).
+			if phys != nil {
+				acct.Disabled = phys.Disabled
+				if phys.Name != "" {
+					acct.Name = phys.Name
+				}
+			}
 			acct.Nickname = sa.Account.Nickname
 			acct.UID = sa.Account.UID
-			plan, ci, cr, errs := cachedAccountDetails(f.AuthIndex, sa, force)
-			acct.Plan = plan
-			acct.Checkin = ci
-			acct.Credits = cr
-			acct.Error = strings.Join(errs, "; ")
+			acct.Region = accountRegion(sa)
+			if fetchCredits {
+				plan, ci, cr, errs := cachedAccountDetails(f.AuthIndex, sa, force)
+				acct.Plan = plan
+				acct.Checkin = ci
+				acct.Credits = cr
+				acct.Exhausted = isCreditsExhausted(cr)
+				if isGlobalDomain(sa.Auth.Domain) {
+					acct.TrialClaimed = hasTrialPack(cr)
+				}
+				// Keep note in sync (throttled); do not block dashboard on save errors.
+				_ = syncAuthNote(f.AuthIndex, sa, cr, acct.Disabled)
+				acct.Error = strings.Join(errs, "; ")
+			} else {
+				// Light load: use cached values if available, but don't fetch upstream.
+				if v, ok := accountCache.Load(f.AuthIndex); ok {
+					if e, ok2 := v.(*accountCacheEntry); ok2 {
+						acct.Plan = e.plan
+						acct.Checkin = e.checkin
+						acct.Credits = e.credits
+						acct.Exhausted = isCreditsExhausted(e.credits)
+						if isGlobalDomain(sa.Auth.Domain) {
+							acct.TrialClaimed = hasTrialPack(e.credits)
+						}
+					}
+				}
+			}
 			out[i] = acct
 		}(i, f)
 	}
 	wg.Wait()
+	// After refresh (force), run lifecycle so exhaust→disable/delete is immediate.
+	var life []map[string]any
+	if force && lifecycleEnabled() {
+		life = reconcileAllAccounts(true)
+		// Drop accounts deleted during reconcile (Global exhaust) and refresh
+		// disabled/exhausted from disk/cache (host list may lag after save).
+		if files2, err2 := hostAuthList(); err2 == nil {
+			live := make(map[string]struct{}, len(files2))
+			disabledBy := make(map[string]bool, len(files2))
+			for _, f := range files2 {
+				live[f.AuthIndex] = struct{}{}
+				// Prefer host list Disabled after reconcile; avoids N extra host.auth.get.
+				// Dashboard row load already used hostAuthGetBundle for physical truth.
+				disabledBy[f.AuthIndex] = f.Disabled
+			}
+			filtered := out[:0]
+			for _, a := range out {
+				if _, ok := live[a.AuthIndex]; !ok {
+					continue
+				}
+				if d, ok := disabledBy[a.AuthIndex]; ok {
+					a.Disabled = d
+				}
+				// Credits may have been refreshed during reconcile — re-read cache.
+				if v, ok := accountCache.Load(a.AuthIndex); ok {
+					if e, ok2 := v.(*accountCacheEntry); ok2 {
+						if e.credits != nil {
+							a.Credits = e.credits
+							a.Exhausted = isCreditsExhausted(e.credits)
+						}
+						if e.plan != "" {
+							a.Plan = e.plan
+						}
+						if e.checkin != nil {
+							a.Checkin = e.checkin
+						}
+					}
+				}
+				filtered = append(filtered, a)
+			}
+			out = filtered
+		}
+	}
 	checkinAutoMu.RLock()
 	auto := checkinAuto
 	checkinAutoMu.RUnlock()
+	// Ensure default selection for panel + scheduler (first usable card).
+	activeID := ensureDefaultActiveAuth(out)
+	// Aggregate credits for panel/API consumers (all accounts currently in out).
+	sum := summarizeCredits(out)
+	// Mark selected account in list for UI.
+	for i := range out {
+		out[i].Selected = out[i].AuthIndex == activeID
+	}
+	resp := map[string]any{
+		"accounts":       out,
+		"active_auth":    activeID,
+		"checkin_auto":   auto,
+		"lifecycle_auto": lifecycleEnabled(),
+		"schedule":       []string{"09:00", "21:00"},
+		"server_time":    time.Now().Format("2006-01-02 15:04:05"),
+		"summary":        sum,
+	}
+	if len(life) > 0 {
+		resp["lifecycle"] = life
+	}
+	return resp
+}
+
+// summarizeCredits aggregates remain/used across dashboard accounts.
+func summarizeCredits(accounts []wbAccount) map[string]any {
+	var remain, used, size, cnRemain, cnUsed, cnSize, glRemain, glUsed, glSize int64
+	var known, disabledN, exhaustedN, packs int
+	for _, a := range accounts {
+		if a.Disabled {
+			disabledN++
+		}
+		if a.Exhausted {
+			exhaustedN++
+		}
+		if a.Credits == nil {
+			continue
+		}
+		cr := a.Credits
+		if cr.TotalRemain == 0 && cr.TotalUsed == 0 && cr.TotalSize == 0 && len(cr.Packages) == 0 {
+			continue
+		}
+		known++
+		remain += cr.TotalRemain
+		used += cr.TotalUsed
+		size += cr.TotalSize
+		packs += cr.PackCount
+		if a.Region == "global" {
+			glRemain += cr.TotalRemain
+			glUsed += cr.TotalUsed
+			glSize += cr.TotalSize
+		} else {
+			cnRemain += cr.TotalRemain
+			cnUsed += cr.TotalUsed
+			cnSize += cr.TotalSize
+		}
+	}
+	total := remain + used
+	if size > total {
+		total = size
+	}
 	return map[string]any{
-		"accounts":     out,
-		"checkin_auto": auto,
-		"schedule":     []string{"09:00", "21:00"},
-		"server_time":  time.Now().Format("2006-01-02 15:04:05"),
+		"account_count":   len(accounts),
+		"known_count":     known,
+		"disabled_count":  disabledN,
+		"exhausted_count": exhaustedN,
+		"pack_count":      packs,
+		"total_remain":    remain,
+		"total_used":      used,
+		"total_size":      size,
+		"total":           total,
+		"cn_remain":       cnRemain,
+		"cn_used":         cnUsed,
+		"cn_size":         cnSize,
+		"global_remain":   glRemain,
+		"global_used":     glUsed,
+		"global_size":     glSize,
 	}
 }
 
@@ -647,11 +1200,15 @@ func schedulerLoop(stop chan struct{}) {
 	}
 }
 
+// runAutoCheckin is the scheduled lifecycle tick (09:00 / 21:00).
+// CN: optional daily check-in, then reconcile (disable exhausted / reenable after credits).
+// Global: no auto trial (one-shot claim is manual only); reconcile may delete exhausted auths.
 func runAutoCheckin() {
 	checkinAutoMu.RLock()
-	enabled := checkinAuto
+	doCheckin := checkinAuto
 	checkinAutoMu.RUnlock()
-	if !enabled {
+	// Lifecycle may still run when check-in is off (credit gate).
+	if !doCheckin && !lifecycleEnabled() {
 		return
 	}
 	files, err := hostAuthList()
@@ -659,19 +1216,36 @@ func runAutoCheckin() {
 		return
 	}
 	for _, f := range files {
-		sa, err := hostAuthGet(f.AuthIndex)
-		if err != nil {
+		// A-24: only fetch sa when needed (checkin). For lifecycle-only paths,
+		// let reconcileOneAccount do the single hostAuthGetBundle internally.
+		if doCheckin {
+			sa, err := hostAuthGet(f.AuthIndex)
+			if err != nil {
+				continue
+			}
+			if isGlobalDomain(sa.Auth.Domain) {
+				// Global: never check-in or auto-claim trial. Lifecycle only.
+				accountCache.Delete(f.AuthIndex)
+				if lifecycleEnabled() {
+					_, _ = reconcileOneAccount(f.AuthIndex, true)
+				}
+				continue
+			}
+			// CN: daily check-in when enabled.
+			ci, err := fetchCheckinStatus(sa)
+			if err == nil && ci.Active && !ci.TodayCheckedIn {
+				_, _ = performCheckinCall(sa)
+			}
+			accountCache.Delete(f.AuthIndex)
+			if lifecycleEnabled() {
+				_, _ = reconcileOneAccount(f.AuthIndex, true)
+			}
 			continue
 		}
-		ci, err := fetchCheckinStatus(sa)
-		if err != nil {
-			continue
+		// Lifecycle-only (checkin off): reconcile handles its own get.
+		if lifecycleEnabled() {
+			_, _ = reconcileOneAccount(f.AuthIndex, true)
 		}
-		if ci.Active && !ci.TodayCheckedIn {
-			_, _ = performCheckinCall(sa)
-		}
-		// Refresh cache for panel regardless.
-		accountCache.Delete(f.AuthIndex)
 	}
 }
 
@@ -705,9 +1279,12 @@ func managementRegistration() managementRegistrationResponse {
 			{Method: http.MethodPost, Path: base + "/checkin", Description: "Manually check in one account (auth_index) or all."},
 			{Method: http.MethodPost, Path: base + "/checkin/config", Description: "Toggle auto check-in (enabled: true/false)."},
 			{Method: http.MethodGet, Path: base + "/credits", Description: "Get real-time credits for one (auth_index query) or all accounts."},
+			{Method: http.MethodPost, Path: base + "/import", Description: "Import WorkBuddy credential JSON (nested or flat) into host auth store."},
+			{Method: http.MethodPost, Path: base + "/trial", Description: "Claim expert trial pack for one Global account (auth_index). One-time 250 credits / 14 days."},
+			{Method: http.MethodPost, Path: base + "/select", Description: "Select the active account card used for chat routing (body: {auth_index})."},
 		},
 		Resources: []resourceRoute{
-			{Path: "/panel", Menu: "WorkBuddy", Description: "WorkBuddy dashboard: credits, check-in, plan."},
+			{Path: "/panel", Menu: "WorkBuddy", Description: "WorkBuddy dashboard: credits, check-in, plan, import."},
 		},
 	}
 }
@@ -729,15 +1306,21 @@ func handleManagement(raw []byte) ([]byte, error) {
 	base := "/v0/management/plugins/" + providerName
 	switch {
 	case req.Method == http.MethodGet && path == base+"/accounts":
-		return okEnvelope(mgmtJSONResponse(http.StatusOK, buildDashboard(false)))
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, buildDashboardEx(false, false)))
 	case req.Method == http.MethodPost && path == base+"/refresh":
-		return okEnvelope(mgmtJSONResponse(http.StatusOK, buildDashboard(true)))
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, buildDashboardEx(true, true)))
 	case req.Method == http.MethodPost && path == base+"/checkin":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleManualCheckin(req)))
 	case req.Method == http.MethodPost && path == base+"/checkin/config":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleCheckinConfig(req)))
 	case req.Method == http.MethodGet && path == base+"/credits":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleCreditsQuery(req)))
+	case req.Method == http.MethodPost && path == base+"/import":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleImportAuth(req)))
+	case req.Method == http.MethodPost && path == base+"/trial":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleClaimTrial(req)))
+	case req.Method == http.MethodPost && path == base+"/select":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleSelectAuth(req)))
 	}
 	return okEnvelope(mgmtJSONResponse(http.StatusNotFound, map[string]any{"error": "not found: " + path}))
 }
@@ -755,12 +1338,27 @@ func mgmtHTMLResponse(body []byte) pluginapi.ManagementResponse {
 	return pluginapi.ManagementResponse{StatusCode: http.StatusOK, Headers: h, Body: body}
 }
 
+// checkinCandidate is a CN account that still needs daily check-in after prefilter.
+type checkinCandidate struct {
+	authIndex string
+	nickname  string
+	sa        *storedAuth
+}
+
+// handleManualCheckin prefilters before any check-in call:
+//  1. Global → skip (trial pack, not daily check-in)
+//  2. CN already checked in today → skip (not a failure)
+//  3. Only remaining CN accounts call performCheckinCall
+//
+// Batch mode (empty auth_index) never returns Global/already as fake failures.
+// Single-account mode still returns a clear skip message for Global/already.
 func handleManualCheckin(req pluginapi.ManagementRequest) map[string]any {
 	var body struct {
 		AuthIndex string `json:"auth_index"`
 	}
 	_ = json.Unmarshal(req.Body, &body)
 	authIndex := strings.TrimSpace(body.AuthIndex)
+	single := authIndex != ""
 
 	files, err := hostAuthList()
 	if err != nil {
@@ -768,42 +1366,341 @@ func handleManualCheckin(req pluginapi.ManagementRequest) map[string]any {
 	}
 	var targets []pluginapi.HostAuthFileEntry
 	for _, f := range files {
-		if authIndex == "" || f.AuthIndex == authIndex {
+		if !single || f.AuthIndex == authIndex {
 			targets = append(targets, f)
 		}
 	}
 	if len(targets) == 0 {
 		return map[string]any{"error": "no matching account"}
 	}
-	results := make([]map[string]any, 0, len(targets))
-	for _, f := range targets {
-		sa, err := hostAuthGet(f.AuthIndex)
-		if err != nil {
-			results = append(results, map[string]any{"auth_index": f.AuthIndex, "error": err.Error()})
-			continue
-		}
-		ci, _ := fetchCheckinStatus(sa)
-		if ci != nil && ci.Active && ci.TodayCheckedIn {
-			results = append(results, map[string]any{
-				"auth_index": f.AuthIndex, "nickname": sa.Account.Nickname,
-				"success": false, "message": "already checked in today",
-			})
-			accountCache.Delete(f.AuthIndex)
-			continue
-		}
-		res, err := performCheckinCall(sa)
-		out := map[string]any{"auth_index": f.AuthIndex, "nickname": sa.Account.Nickname}
-		if err != nil {
-			out["error"] = err.Error()
-		} else {
-			for k, v := range res {
-				out[k] = v
+
+	// --- Phase 1: classify (filter) before any check-in side effect ---
+	var (
+		skippedGlobal int
+		already       int
+		eligible      []checkinCandidate
+		results       []map[string]any
+	)
+	// Concurrent classify: N accounts × status API; serial was multi-second and
+	// could trip browser/gateway cancel (502 context canceled).
+	type classResult struct {
+		idx    int
+		f      pluginapi.HostAuthFileEntry
+		sa     *storedAuth
+		kind   string // "err" | "global" | "already" | "eligible"
+		nick   string
+		errMsg string
+	}
+	classCh := make(chan classResult, len(targets))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 6) // bound upstream concurrency
+	for i, f := range targets {
+		wg.Add(1)
+		go func(i int, f pluginapi.HostAuthFileEntry) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			sa, err := hostAuthGet(f.AuthIndex)
+			if err != nil {
+				classCh <- classResult{idx: i, f: f, kind: "err", errMsg: err.Error()}
+				return
 			}
+			nick := sa.Account.Nickname
+			if isGlobalDomain(sa.Auth.Domain) {
+				classCh <- classResult{idx: i, f: f, sa: sa, kind: "global", nick: nick}
+				return
+			}
+			// Prefer fresh status; fall back to cache today_checked_in if status fails.
+			ci, ciErr := fetchCheckinStatus(sa)
+			if ciErr != nil {
+				if cached := cachedCheckinToday(f.AuthIndex); cached != nil && *cached {
+					classCh <- classResult{idx: i, f: f, sa: sa, kind: "already", nick: nick}
+					return
+				}
+				// Status unknown → still try check-in (upstream is idempotent).
+				classCh <- classResult{idx: i, f: f, sa: sa, kind: "eligible", nick: nick}
+				return
+			}
+			if ci != nil && ci.TodayCheckedIn {
+				classCh <- classResult{idx: i, f: f, sa: sa, kind: "already", nick: nick}
+				return
+			}
+			classCh <- classResult{idx: i, f: f, sa: sa, kind: "eligible", nick: nick}
+		}(i, f)
+	}
+	go func() { wg.Wait(); close(classCh) }()
+	// Preserve input order for stable UI.
+	classified := make([]classResult, len(targets))
+	got := 0
+	for cr := range classCh {
+		classified[cr.idx] = cr
+		got++
+	}
+	_ = got
+	for _, cr := range classified {
+		if cr.kind == "" {
+			continue
+		}
+		switch cr.kind {
+		case "err":
+			results = append(results, map[string]any{
+				"auth_index": cr.f.AuthIndex, "error": cr.errMsg, "skipped": false,
+			})
+		case "global":
+			skippedGlobal++
+			if single {
+				results = append(results, map[string]any{
+					"auth_index": cr.f.AuthIndex, "nickname": cr.nick,
+					"success": false, "skipped": true, "reason": "global",
+					"message": "国际版账号不支持签到，请使用领取专家加油包",
+				})
+			}
+		case "already":
+			already++
+			// Light cache refresh path for reenable after prior disable.
+			accountCache.Delete(cr.f.AuthIndex)
+			if lifecycleEnabled() {
+				_, _ = reconcileOneAccount(cr.f.AuthIndex, true)
+			}
+			if single {
+				results = append(results, map[string]any{
+					"auth_index": cr.f.AuthIndex, "nickname": cr.nick,
+					"success": true, "skipped": true, "reason": "already",
+					"message": "already checked in today",
+				})
+			}
+		case "eligible":
+			eligible = append(eligible, checkinCandidate{
+				authIndex: cr.f.AuthIndex, nickname: cr.nick, sa: cr.sa,
+			})
+		}
+	}
+
+	// --- Phase 2: check-in only filtered CN accounts ---
+	type checkinOut struct {
+		idx int
+		out map[string]any
+	}
+	outCh := make(chan checkinOut, len(eligible))
+	var wg2 sync.WaitGroup
+	sem2 := make(chan struct{}, 4)
+	for i, c := range eligible {
+		wg2.Add(1)
+		go func(i int, c checkinCandidate) {
+			defer wg2.Done()
+			sem2 <- struct{}{}
+			defer func() { <-sem2 }()
+			mu := checkinLockFor(c.authIndex)
+			mu.Lock()
+			// Re-read under lock: another tab may have just checked in.
+			sa := c.sa
+			if sa2, err := hostAuthGet(c.authIndex); err == nil && sa2 != nil {
+				sa = sa2
+			}
+			if ci, _ := fetchCheckinStatus(sa); ci != nil && ci.TodayCheckedIn {
+				mu.Unlock()
+				outCh <- checkinOut{idx: i, out: map[string]any{
+					"auth_index": c.authIndex, "nickname": c.nickname,
+					"success": true, "skipped": true, "reason": "already",
+					"message": "already checked in today",
+				}}
+				accountCache.Delete(c.authIndex)
+				if lifecycleEnabled() {
+					_, _ = reconcileOneAccount(c.authIndex, true)
+				}
+				return
+			}
+			res, err := performCheckinCall(sa)
+			out := map[string]any{"auth_index": c.authIndex, "nickname": c.nickname, "skipped": false}
+			if err != nil {
+				out["error"] = err.Error()
+				out["success"] = false
+			} else {
+				// performCheckinCall surfaces business errors as success=false+message.
+				for k, v := range res {
+					out[k] = v
+				}
+				if msg, _ := out["message"].(string); msg != "" && out["success"] == false {
+					// Map "already" style business messages to done, not hard fail.
+					low := strings.ToLower(msg)
+					if strings.Contains(low, "already") || strings.Contains(msg, "已签") || strings.Contains(msg, "今日") {
+						out["success"] = true
+						out["skipped"] = true
+						out["reason"] = "already"
+					}
+				}
+				if _, ok := out["success"]; !ok {
+					out["success"] = true
+				}
+			}
+			accountCache.Delete(c.authIndex)
+			mu.Unlock()
+			if lifecycleEnabled() {
+				_, _ = reconcileOneAccount(c.authIndex, true)
+			}
+			outCh <- checkinOut{idx: i, out: out}
+		}(i, c)
+	}
+	go func() { wg2.Wait(); close(outCh) }()
+	phase2 := make([]map[string]any, len(eligible))
+	for o := range outCh {
+		phase2[o.idx] = o.out
+	}
+	successN, failN, already2 := 0, 0, 0
+	for _, out := range phase2 {
+		if out == nil {
+			continue
 		}
 		results = append(results, out)
-		accountCache.Delete(f.AuthIndex)
+		if out["error"] != nil {
+			failN++
+			continue
+		}
+		if reason, _ := out["reason"].(string); reason == "already" || out["skipped"] == true {
+			// late already under lock
+			if reason == "already" {
+				already2++
+			}
+		}
+		if out["success"] == true {
+			if reason, _ := out["reason"].(string); reason == "already" {
+				// counted in already2
+			} else {
+				successN++
+			}
+		} else if out["error"] == nil && out["success"] == false {
+			// business soft-fail without error field
+			msg, _ := out["message"].(string)
+			if strings.Contains(strings.ToLower(msg), "already") || strings.Contains(msg, "已签") {
+				already2++
+			} else {
+				failN++
+			}
+		}
 	}
-	return map[string]any{"results": results}
+	alreadyTotal := already + already2
+	return map[string]any{
+		"results": results,
+		"summary": map[string]any{
+			"total":          len(targets),
+			"eligible":       len(eligible),
+			"success":        successN,
+			"already":        alreadyTotal,
+			"skipped_global": skippedGlobal,
+			"fail":           failN,
+			"attempted":      len(eligible),
+		},
+	}
+}
+
+// cachedCheckinToday returns cached today_checked_in when present.
+func cachedCheckinToday(authIndex string) *bool {
+	v, ok := accountCache.Load(authIndex)
+	if !ok {
+		return nil
+	}
+	e, ok := v.(*accountCacheEntry)
+	if !ok || e == nil || e.checkin == nil {
+		return nil
+	}
+	b := e.checkin.TodayCheckedIn
+	return &b
+}
+
+// checkinLocks serializes per-account manual check-in (B4).
+// Entries are pruned during dashboard prune to avoid unbounded growth
+// when auth accounts are deleted/rotated.
+var (
+	checkinLocks sync.Map // auth_index -> *sync.Mutex
+)
+
+func checkinLockFor(authIndex string) *sync.Mutex {
+	v, _ := checkinLocks.LoadOrStore(authIndex, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
+// pruneCheckinLocks removes lock entries for auth indices that no longer
+// exist in hostAuthList. Call after dashboard prune.
+func pruneCheckinLocks() {
+	files, err := hostAuthList()
+	if err != nil {
+		return
+	}
+	live := make(map[string]struct{}, len(files))
+	for _, f := range files {
+		live[f.AuthIndex] = struct{}{}
+	}
+	checkinLocks.Range(func(key, _ any) bool {
+		idx, _ := key.(string)
+		if _, ok := live[idx]; !ok {
+			checkinLocks.Delete(key)
+		}
+		return true
+	})
+}
+
+// handleImportAuth accepts nested or flat credential JSON and persists via host.auth.save.
+func handleImportAuth(req pluginapi.ManagementRequest) map[string]any {
+	var body struct {
+		JSON json.RawMessage `json:"json"`
+		Raw  string          `json:"raw"`
+	}
+	_ = json.Unmarshal(req.Body, &body)
+	raw := []byte(strings.TrimSpace(body.Raw))
+	if len(body.JSON) > 0 {
+		raw = body.JSON
+	}
+	if len(raw) == 0 {
+		return map[string]any{"success": false, "error": "missing json/raw credential payload"}
+	}
+	sa, err := parseStored(raw)
+	if err != nil {
+		return map[string]any{"success": false, "error": err.Error()}
+	}
+	// Persist nested storage + top-level type/note/logo/disabled for Auth page.
+	fileJSON, err := buildAuthFileJSON(sa, false, displayNote(sa, nil, false), nil)
+	if err != nil {
+		return map[string]any{"success": false, "error": err.Error()}
+	}
+	auth := toAuthData(sa)
+	saveReq := pluginapi.HostAuthSaveRequest{
+		Name: auth.FileName,
+		JSON: fileJSON,
+	}
+	saveBody, _ := json.Marshal(saveReq)
+	rawResp, err := hostCall(pluginabi.MethodHostAuthSave, saveBody)
+	if err != nil {
+		return map[string]any{"success": false, "error": "host.auth.save: " + err.Error()}
+	}
+	var env envelope
+	if err := json.Unmarshal(rawResp, &env); err != nil || !env.OK {
+		msg := "host.auth.save failed"
+		if env.Error != nil && env.Error.Message != "" {
+			msg = env.Error.Message
+		}
+		return map[string]any{"success": false, "error": msg}
+	}
+	var saveResp pluginapi.HostAuthSaveResponse
+	_ = json.Unmarshal(env.Result, &saveResp)
+	// Remove legacy workbuddy.json if it exists and differs from the saved name.
+	if saveResp.Name != "" && !strings.EqualFold(saveResp.Name, authFileName) {
+		legacyPath := strings.TrimSpace(saveResp.Path)
+		// Best-effort: if auth dir is known via saveResp.Path parent, try removing sibling workbuddy.json.
+		if legacyPath != "" {
+			dir := filepath.Dir(legacyPath)
+			legacyFile := filepath.Join(dir, authFileName)
+			// A-35: use deleteAuthFileInDir for absolute path + directory confinement.
+			_ = deleteAuthFileInDir(legacyFile, dir)
+		}
+	}
+	return map[string]any{
+		"success":  true,
+		"name":     saveResp.Name,
+		"path":     saveResp.Path,
+		"uid":      sa.Account.UID,
+		"nickname": sa.Account.Nickname,
+		"file":     auth.FileName,
+	}
 }
 
 func handleCheckinConfig(req pluginapi.ManagementRequest) map[string]any {
@@ -824,8 +1721,93 @@ func handleCheckinConfig(req pluginapi.ManagementRequest) map[string]any {
 	return map[string]any{"checkin_auto": cur, "persistent": false}
 }
 
+// handleClaimTrial claims the expert trial pack for one Global account.
+// CN accounts are rejected — the trial endpoint is Global-only.
+func handleClaimTrial(req pluginapi.ManagementRequest) map[string]any {
+	var body struct {
+		AuthIndex string `json:"auth_index"`
+	}
+	_ = json.Unmarshal(req.Body, &body)
+	authIndex := strings.TrimSpace(body.AuthIndex)
+	if authIndex == "" {
+		return map[string]any{"error": "auth_index is required"}
+	}
+	files, err := hostAuthList()
+	if err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	for _, f := range files {
+		if f.AuthIndex != authIndex {
+			continue
+		}
+		sa, err := hostAuthGet(f.AuthIndex)
+		if err != nil {
+			return map[string]any{"auth_index": authIndex, "error": err.Error()}
+		}
+		if !isGlobalDomain(sa.Auth.Domain) {
+			return map[string]any{"auth_index": authIndex, "error": "专家加油包仅适用于国际版账号"}
+		}
+		res, err := performTrialCall(sa)
+		out := map[string]any{"auth_index": authIndex, "nickname": sa.Account.Nickname}
+		if err != nil {
+			out["error"] = err.Error()
+		} else {
+			for k, v := range res {
+				out[k] = v
+			}
+		}
+		accountCache.Delete(authIndex) // refresh cache
+		if lifecycleEnabled() {
+			_, _ = reconcileOneAccount(authIndex, true)
+		}
+		return out
+	}
+	return map[string]any{"error": "account not found"}
+}
+
+// handleSelectAuth sets the panel-selected account used for chat routing.
+// Region (CN/Global) is read from that account's stored domain on each request.
+func handleSelectAuth(req pluginapi.ManagementRequest) map[string]any {
+	var body struct {
+		AuthIndex string `json:"auth_index"`
+	}
+	_ = json.Unmarshal(req.Body, &body)
+	authIndex := strings.TrimSpace(body.AuthIndex)
+	if authIndex == "" {
+		return map[string]any{"error": "auth_index is required", "active_auth": getActiveAuthID()}
+	}
+	files, err := hostAuthList()
+	if err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	for _, f := range files {
+		if f.AuthIndex != authIndex {
+			continue
+		}
+		if f.Disabled {
+			return map[string]any{"error": "账号已禁用，无法选中", "auth_index": authIndex}
+		}
+		sa, err := hostAuthGet(f.AuthIndex)
+		if err != nil {
+			return map[string]any{"error": err.Error(), "auth_index": authIndex}
+		}
+		setActiveAuthID(authIndex)
+		return map[string]any{
+			"ok":          true,
+			"active_auth": authIndex,
+			"region":      accountRegion(sa),
+			"nickname":    sa.Account.Nickname,
+			"uid":         sa.Account.UID,
+		}
+	}
+	return map[string]any{"error": "account not found", "auth_index": authIndex}
+}
+
 // handleCreditsQuery returns real-time credits for one or all accounts.
 // Pass ?auth_index=<idx> to query a single account; omit for all.
+// Single-account mode returns full account info (nickname, region, credits,
+// exhausted, trial_claimed) so the panel can update one card without
+// reloading the entire dashboard.
 func handleCreditsQuery(req pluginapi.ManagementRequest) map[string]any {
 	authIndex := ""
 	if vals := req.Query["auth_index"]; len(vals) > 0 {
@@ -835,6 +1817,64 @@ func handleCreditsQuery(req pluginapi.ManagementRequest) map[string]any {
 	if err != nil {
 		return map[string]any{"error": err.Error()}
 	}
+	// Single-account: return one full account row (like dashboard entry).
+	if authIndex != "" {
+		for _, f := range files {
+			if f.AuthIndex != authIndex {
+				continue
+			}
+			sa, err := hostAuthGet(f.AuthIndex)
+			if err != nil {
+				return map[string]any{"accounts": []map[string]any{{
+					"auth_index": authIndex, "error": "load auth: " + err.Error(),
+				}}}
+			}
+			cr, err := fetchUserResource(sa)
+			acct := map[string]any{
+				"auth_index": authIndex,
+				"nickname":   sa.Account.Nickname,
+				"uid":        sa.Account.UID,
+				"region":      accountRegion(sa),
+				"name":       f.Name,
+				"label":      f.Label,
+				"disabled":   f.Disabled,
+				"selected":   getActiveAuthID() == authIndex,
+			}
+			if err != nil {
+				acct["error"] = err.Error()
+			} else {
+				acct["credits"] = cr
+				acct["exhausted"] = isCreditsExhausted(cr)
+				if isGlobalDomain(sa.Auth.Domain) {
+					acct["trial_claimed"] = hasTrialPack(cr)
+				}
+				// Also fetch plan so the badge updates on lazy load.
+				acct["plan"] = fetchPaymentType(sa)
+				// Update cache so subsequent dashboard loads see fresh data.
+				now := time.Now()
+				if cr != nil {
+					cr.FetchedAt = now.UTC().Format(time.RFC3339)
+				}
+				// Merge into existing cache entry (keep plan/checkin if present).
+				var prev *accountCacheEntry
+				if v, ok := accountCache.Load(authIndex); ok {
+					prev, _ = v.(*accountCacheEntry)
+				}
+				var plan string
+				var ci *checkinSummary
+				if prev != nil {
+					plan = prev.plan
+					ci = prev.checkin
+				}
+				accountCache.Store(authIndex, &accountCacheEntry{
+					checkin: ci, credits: cr, plan: plan, fetched: now,
+				})
+			}
+			return map[string]any{"accounts": []map[string]any{acct}}
+		}
+		return map[string]any{"error": "account not found"}
+	}
+	// All accounts: return simplified list.
 	type acctCredits struct {
 		AuthIndex string           `json:"auth_index"`
 		Nickname  string           `json:"nickname"`
@@ -844,9 +1884,6 @@ func handleCreditsQuery(req pluginapi.ManagementRequest) map[string]any {
 	}
 	var out []acctCredits
 	for _, f := range files {
-		if authIndex != "" && f.AuthIndex != authIndex {
-			continue
-		}
 		sa, err := hostAuthGet(f.AuthIndex)
 		if err != nil {
 			out = append(out, acctCredits{AuthIndex: f.AuthIndex, Error: "load auth: " + err.Error()})

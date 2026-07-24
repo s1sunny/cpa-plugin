@@ -1,6 +1,15 @@
 PLUGIN_ID ?= workbuddy
-VERSION ?= 0.3.16
+# Prefer workbuddy/VERSION so local `make build` matches release/CI.
+VERSION ?= $(shell tr -d ' \n\r' < VERSION 2>/dev/null)
+ifeq ($(strip $(VERSION)),)
+VERSION := 0.6.0
+endif
 GO ?= go
+# Ensure go is on PATH for both parse-time $(shell) calls and recipes.
+ifeq ($(shell command -v $(GO) 2>/dev/null),)
+GO := /usr/local/go/bin/go
+export PATH := /usr/local/go/bin:$(PATH)
+endif
 GOOS ?= $(shell $(GO) env GOOS)
 GOARCH ?= $(shell $(GO) env GOARCH)
 CC ?= $(shell $(GO) env CC)
@@ -23,7 +32,15 @@ build:
 		$(GO) build -trimpath -buildmode=c-shared -ldflags "$(LD_FLAGS)" -o $(PLUGIN_BIN) .
 	rm -f $(basename $(PLUGIN_BIN)).h
 
+test:
+	$(GO) test ./...
+
+vet:
+	$(GO) vet ./...
+
+check: test vet
+
 clean:
 	rm -rf $(DIST_DIR)
 
-.PHONY: build clean
+.PHONY: build test vet check clean

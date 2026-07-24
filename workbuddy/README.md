@@ -1,24 +1,36 @@
-# WorkBuddy 插件
+# WorkBuddy Plugin / WorkBuddy 插件
 
-WorkBuddy（CodeBuddy）CPA 插件，基于 Tencent CodeBuddy（原 WorkBuddy）OAuth 流程，支持动态模型拉取、每日自动签到、积分与套餐面板展示。
+[English](#english) | [中文](#中文)
 
-## 功能特性
+Tencent **CodeBuddy** (`copilot.tencent.com`) provider plugin for [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI).
 
-- **OAuth 登录**：通过 CodeBuddy 网页扫码/授权流程获取 access token。
-- **动态模型拉取**：登录后自动从 `copilot.tencent.com` 拉取可用模型列表，无需硬编码。
-- **每日自动签到**：支持每日 09:00 和 21:00 自动签到领取积分。
-- **积分与套餐面板**：在 CPA 管理面板查看账号昵称、积分余额、套餐余量、用量进度、签到状态。
-- **OAuth 模型别名/禁用**：由 CPA 原生 `oauth-model-alias` / `oauth-excluded-models` 管理。
+---
 
-## 安装方法
+## 中文
 
-1. 将构建产物 `workbuddy.so` 复制到 CPA 的插件目录：
+### 功能
+
+- **OAuth 登录**：多账号 `workbuddy-<uid>.json`
+- **动态模型**：上游 models API + 5min 缓存 + 硬编码 fallback
+- **Executor**：流/非流 SSE 聚合、cleanChunk、跨协议 framing、alias 反解、tool_choice 归一
+- **Usage 上报**：`usage.PublishRecord` 三出口
+- **签到**：CN 09:00 / 21:00 + 面板手动；多标签 per-account 锁；**Global 不定时领 trial**
+- **积分生命周期**：CN 耗尽自动 `disabled`；有积分/签到后再开；Global 耗尽**删除** auth 文件
+- **积分面板**：耗尽/禁用角标、进度条、CN/Global 筛选、导入凭证、防 management key IP 封禁
+- **Scheduler**（可选）：`scheduler_mode: off|credits`（**默认 off**）；credits 优先非耗尽账号
+- **OAuth 别名/排除**：由 CPA 宿主 `oauth-model-alias` / `oauth-excluded-models` 处理
+
+### 安装
+
+**推荐：从 GitHub Release 安装多架构包**（符合 CPA 插件商店 `ArchiveName`）：
 
 ```bash
+# linux/amd64（x86_64 服务器）
+unzip workbuddy_0.6.0_linux_amd64.zip   # → workbuddy.so
 cp workbuddy.so /path/to/cliproxyapi/plugins/workbuddy.so
 ```
 
-2. 在 CPA `config.yaml` 中启用插件：
+也可放在平台子目录：`plugins/linux/amd64/`、`plugins/darwin/arm64/` 等。
 
 ```yaml
 plugins:
@@ -27,81 +39,148 @@ plugins:
   configs:
     workbuddy:
       enabled: true
+      # checkin_auto: true      # CN 定时签到
+      # lifecycle_auto: true    # 耗尽关/删、回血再开
+      # scheduler_mode: off     # or credits
 ```
 
-3. 重启 CPA 服务。
+重启 CPA。
 
-## 构建方法
+### 登录 / 凭证
 
-需要 Go 1.26.0+ 环境：
+1. CPA 管理端 OAuth 选择 WorkBuddy 完成授权；或  
+2. 面板「导入凭证」弹窗粘贴 JSON → `POST .../import`  
+3. 落盘：`auths/workbuddy-<uid>.json`（含 `type`/`note`/`disabled` + nested auth）
+
+### 生命周期规则
+
+| 区域 | 积分耗尽 | 之后 |
+|------|----------|------|
+| CN | 写 `disabled:true` | 签到/刷新后有积分 → 再打开 |
+| Global | **删除文件** | 需重新登录/导入 |
+
+Auth 页 CPAMP 备注行显示 `note`（区域+积分摘要）。筛选图标「W」属 CPAMP 前端静态表，**插件无法改成 logo**；完整管理用侧栏 WorkBuddy 面板。
+
+### 预期模型
+
+`/v1/models` 中 `owned_by=workbuddy` 的动态列表（账号权限为准），常见：`deepseek-v4-flash` / `deepseek-v4-pro` / `glm-5.x` / `kimi-k2.7` / `hy3*` / `minimax-m3` 等；可用 `oauth-model-alias` / `oauth-excluded-models` 管理。
+
+### CPAMP / 远程更新
+
+- 源码仓：`https://github.com/Sliverkiss/cpa-plugin`
+- **商店源（registry）**：`https://raw.githubusercontent.com/Sliverkiss/cpa-plugin/main/registry.json`
+- Release 资产：`workbuddy_<ver>_<goos>_<goarch>.zip` + `checksums.txt`
+- 侧栏：`/v0/resource/plugins/workbuddy/panel`
+
+### 构建与测试
 
 ```bash
 cd workbuddy
-export PATH=$PATH:/usr/local/go/bin
-go build -buildmode=c-shared -o workbuddy.so .
+make test && make vet && make build VERSION=$(cat VERSION)
+# dist/workbuddy.so
 ```
 
-## 配置说明
+### 管理 API
 
-### 自动签到
+| 路径 | 方法 | 说明 |
+|---|---|---|
+| `.../accounts` | GET | 账号 + credits + **exhausted** + **disabled** |
+| `.../refresh` | POST | 强制刷新缓存 + 生命周期 reconcile |
+| `.../checkin` | POST | 手动签到（CN）；签到后 reenable 检查 |
+| `.../checkin/config` | POST | 自动签到开关 |
+| `.../trial` | POST | Global 专家包一次性领取 |
+| `.../credits` | GET | 实时积分 |
+| `.../import` | POST | 导入凭证 `{"json":{...}}` 或 `{"raw":"..."}` |
 
-插件默认启用自动签到。可通过管理面板开关，或调用管理 API：
+面板：`/v0/resource/plugins/workbuddy/panel`
 
-```bash
-curl -X POST -H "Authorization: Bearer $CPA_MGMT_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"enabled":true}' \
-  http://127.0.0.1:12888/v0/management/plugins/workbuddy/checkin/config
+### 已知策略
+
+- **hy3\*** 系列：executor 将 `reasoning_effort` 钉为 `high`（非 ThinkingApplier 能力；见源码 `forceMaxThinking`）
+- **count_tokens**：上游无 API，返回 `{"input_tokens":0}`
+- **checkin_auto / lifecycle_auto / scheduler_mode**：config_yaml 可配；面板 checkin 开关运行时不写回 yaml
+- **host.http.do**：评估结论见 `docs/host-http-evaluation.md`（暂不迁移）
+- **包结构**：同包多文件，不拆 internal（`docs/package-layout.md`）
+
+### 文件
+
+| 文件 | 说明 |
+|---|---|
+| `main.go` | ABI / OAuth / executor |
+| `management.go` | 面板 / 签到 / 导入 / tick |
+| `lifecycle.go` | 积分耗尽关/删/再开 |
+| `scheduler.go` | scheduler.pick |
+| `panel.html` | 前端 |
+| `LICENSE` / `VERSION` / `CHANGELOG.md` | 发布元数据 |
+| `.github/workflows/build.yml` | 多架构 Release |
+
+---
+
+## English
+
+### Features
+
+OAuth multi-account provider, dynamic models, production executor (SSE, tools, aliases), usage reporting, **CN daily check-in**, **Global one-shot expert trial (manual only)**, **credit lifecycle** (disable CN / delete Global when exhausted; re-enable CN after credits return), credits dashboard with region filters, optional **credits scheduler** (`scheduler_mode`, default `off`), credential JSON import.
+
+### Install
+
+Download the matching zip from [Releases](https://github.com/Sliverkiss/cpa-plugin/releases):
+
+```text
+workbuddy_<version>_linux_amd64.zip   # workbuddy.so
+workbuddy_<version>_linux_arm64.zip
+workbuddy_<version>_darwin_arm64.zip  # workbuddy.dylib
+workbuddy_<version>_windows_amd64.zip # workbuddy.dll
 ```
 
-### OAuth 模型别名 / 禁用
-
-在 CPA `config.yaml` 中配置：
+Unzip and place the library in CPA `plugins/` (or `plugins/<goos>/<goarch>/`). Enable:
 
 ```yaml
-oauth-excluded-models:
-  workbuddy:
-    - hy3
-    - minimax-m3
-
-oauth-model-alias:
-  workbuddy:
-    - name: deepseek-v4-pro
-      alias: workbuddy-dsv4-pro
-      fork: true
+plugins:
+  configs:
+    workbuddy:
+      enabled: true
 ```
 
-## 管理面板
+### Remote update
 
-插件注册了一个 Web 面板：
+Add custom plugin source:
 
+```text
+https://raw.githubusercontent.com/Sliverkiss/cpa-plugin/main/registry.json
 ```
-http://<cpa-host>/v0/resource/plugins/workbuddy/panel
+
+### Build
+
+```bash
+make test && make vet && make build
+# VERSION is read from ./VERSION (override with VERSION=x.y.z)
 ```
 
-面板功能：
-- 查看所有 WorkBuddy 账号的积分、套餐、用量进度
-- 手动签到 / 全部签到
-- 开启/关闭自动签到
+Release artifacts are produced by `.github/workflows/build.yml` for linux/darwin/windows/freebsd multi-arch.
 
-## 管理 API
+### Config
 
-| 接口 | 方法 | 说明 |
-|---|---|---|
-| `/v0/management/plugins/workbuddy/accounts` | GET | 列出账号、积分、签到状态 |
-| `/v0/management/plugins/workbuddy/checkin` | POST | 单个/全部签到 |
-| `/v0/management/plugins/workbuddy/checkin/config` | POST | 设置自动签到开关 |
+```yaml
+plugins:
+  configs:
+    workbuddy:
+      enabled: true
+      scheduler_mode: off   # or credits
+      checkin_auto: true    # CN only
+      lifecycle_auto: true  # disable/delete/reenable on credits
+```
 
-## 文件说明
+### Lifecycle
 
-- `main.go`：插件主入口，OAuth 登录/刷新、模型动态拉取、executor 转发。
-- `management.go`：管理 API 与自动签到调度。
-- `panel.html`：管理面板前端页面。
-- `go.mod` / `go.sum`：Go 模块依赖。
-- `workbuddy.so`：预编译的插件二进制。
+| Region | Exhausted credits | Recovery |
+|--------|-------------------|----------|
+| CN | set `disabled:true` | re-enable after check-in/refresh when remain>0 |
+| Global | **delete auth file** | re-login / re-import |
 
-## 注意事项
+### Notes
 
-- 插件需要 CPA 管理密钥才能访问管理 API；从 CPA 主面板嵌入时会自动读取 localStorage 中的密钥。
-- 多个 WorkBuddy 账号登录时，插件会按 `workbuddy-<uid>.json` 命名保存，避免互相覆盖。
-- 模型列表通过 `GET /console/enterprises/personal/models` 动态获取，需要账号已登录且 token 有效。
+- hy3\* models force `reasoning_effort=high` in-plugin
+- `count_tokens` stub returns zero input tokens
+- CPAMP Auth page filter icon letter "W" cannot be changed from the plugin (static frontend table); use `note` + WorkBuddy panel
+- See `docs/host-http-evaluation.md` and `docs/package-layout.md`

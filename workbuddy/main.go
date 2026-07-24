@@ -61,11 +61,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -81,16 +83,23 @@ const (
 	providerName  = "workbuddy"
 	authFileName  = "workbuddy.json"
 	pluginLogoURL = "https://raw.githubusercontent.com/DGZSbot/ai-icon/refs/heads/main/WorkBuddy.png"
-	upstreamBase  = "https://copilot.tencent.com"
-	clientUA      = "CLI/2.63.2 CodeBuddy/2.63.2"
-	originReferer = "https://www.codebuddy.cn"
+	// CN chat/auth gateway (iss = codebuddy.cn realm).
+	upstreamBaseCN = "https://copilot.tencent.com"
+	// Global chat/auth gateway (iss = workbuddy.ai realm). APISIX on
+	// copilot.tencent.com rejects Global JWTs with 401; must use workbuddy.ai.
+	upstreamBaseGlobal = "https://www.workbuddy.ai"
+	clientUA           = "CLI/2.63.2 CodeBuddy/2.63.2"
+	originReferer      = "https://www.codebuddy.cn"
+	originRefererGlobal = "https://www.workbuddy.ai"
 
-	endpointAuthState    = upstreamBase + "/v2/plugin/auth/state?platform=CLI"
-	endpointLoginAcct    = upstreamBase + "/v2/plugin/login/account?state="
-	endpointAuthToken    = upstreamBase + "/v2/plugin/auth/token?state="
-	endpointTokenRefresh = upstreamBase + "/v2/plugin/auth/token/refresh"
-	endpointChat         = upstreamBase + "/v2/chat/completions"
-	endpointModels       = upstreamBase + "/console/enterprises/personal/models"
+	// Legacy aliases used by CN login defaults / tests.
+	upstreamBase  = upstreamBaseCN
+	endpointAuthState    = upstreamBaseCN + "/v2/plugin/auth/state?platform=CLI"
+	endpointLoginAcct    = upstreamBaseCN + "/v2/plugin/login/account?state="
+	endpointAuthToken    = upstreamBaseCN + "/v2/plugin/auth/token?state="
+	endpointTokenRefresh = upstreamBaseCN + "/v2/plugin/auth/token/refresh"
+	endpointChat         = upstreamBaseCN + "/v2/chat/completions"
+	endpointModels       = upstreamBaseCN + "/console/enterprises/personal/models"
 
 	loginTTL = 5 * time.Minute
 )
@@ -242,7 +251,8 @@ func streamEmitError(streamID, message string) {
 	if streamID == "" {
 		return
 	}
-	errJSON, _ := json.Marshal(map[string]any{"error": map[string]any{"message": message}})
+	// A-37: never emit raw upstream bodies that may contain Bearer/JWT.
+	errJSON, _ := json.Marshal(map[string]any{"error": map[string]any{"message": redactSecrets(message)}})
 	_ = streamEmit(streamID, errJSON)
 }
 
@@ -277,20 +287,22 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handlePollLogin(request)
 	case pluginabi.MethodAuthRefresh:
 		return handleRefreshAuth(request)
-	case pluginabi.MethodFrontendAuthIdentifier:
-		return okEnvelope(identifierResponse{Identifier: providerName})
-	case pluginabi.MethodFrontendAuthAuthenticate:
-		return handleFrontendAuth(request)
 	case pluginabi.MethodExecutorIdentifier:
 		return okEnvelope(identifierResponse{Identifier: providerName})
 	case pluginabi.MethodExecutorExecute:
 		return handleExecExecute(request)
 	case pluginabi.MethodExecutorExecuteStream:
 		return handleExecStream(request)
+	case pluginabi.MethodExecutorCountTokens:
+		// Upstream CodeBuddy has no dedicated count_tokens API. Return
+		// unhandled-style zero estimate so clients fall back / skip.
+		return okEnvelope(pluginapi.ExecutorResponse{Payload: []byte(`{"input_tokens":0}`)})
 	case pluginabi.MethodManagementRegister:
 		return okEnvelope(managementRegistration())
 	case pluginabi.MethodManagementHandle:
 		return handleManagement(request)
+	case pluginabi.MethodSchedulerPick:
+		return handleSchedulerPick(request)
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -334,11 +346,12 @@ type registrationCapability struct {
 	ExecutorModelScope    pluginapi.ExecutorModelScope `json:"executor_model_scope"`
 	ExecutorInputFormats  []string                     `json:"executor_input_formats,omitempty"`
 	ExecutorOutputFormats []string                     `json:"executor_output_formats,omitempty"`
+	Scheduler             bool                         `json:"scheduler"`
 	ManagementAPI         bool                         `json:"management_api"`
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.3.16"
+var version = "0.6.26"
 
 func wbRegistration() registration {
 	return registration{
@@ -350,24 +363,29 @@ func wbRegistration() registration {
 			GitHubRepository: "https://github.com/Sliverkiss/cpa-plugin",
 			Logo:             pluginLogoURL,
 			ConfigFields: []pluginapi.ConfigField{
-				{Name: "checkin_auto", Type: "boolean", Description: "Enable daily auto check-in at 09:00 and 21:00 local time (default true)."},
-				{Name: "models", Type: "array", Description: "Optional model list. Each item can have id, name, alias, context, max_tokens, enabled, reasoning."},
+				{Name: "checkin_auto", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable daily auto check-in at 09:00 and 21:00 local time for CN accounts (default true)."},
+				{Name: "lifecycle_auto", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Auto disable CN / delete Global when credits exhausted; re-enable CN after check-in restores credits (default true)."},
+				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Optional model list. Each item can have id, name, alias, context, max_tokens, enabled, reasoning."},
+				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{schedulerModeOff, schedulerModeCredits}, Description: "Multi-account selection: off (defer to built-in, default) or credits (pick highest remaining)."},
+				{Name: "usage_report_url", Type: pluginapi.ConfigFieldTypeString, Description: "Optional override of CPAMP usage import URL (default http://cpa-manager-plus:18317/v0/management/usage/import; also env USAGE_REPORT_URL)."},
+				{Name: "usage_report_key", Type: pluginapi.ConfigFieldTypeString, Description: "Optional CPAMP admin key override. Prefer auto-detect from env CPAMP_ADMIN_KEY / USAGE_REPORT_KEY or secret file /run/secrets/cpamp_admin_key."},
 			},
 		},
 		Capabilities: registrationCapability{
 			ModelProvider:         true,
 			AuthProvider:          true,
-			FrontendAuthProvider:  true,
+			FrontendAuthProvider:  false,
 			Executor:              true,
-			ExecutorModelScope:    pluginapi.ExecutorModelScopeBoth,
+			ExecutorModelScope:    pluginapi.ExecutorModelScopeOAuth,
 			ExecutorInputFormats:  []string{"chat-completions"},
 			ExecutorOutputFormats: []string{"chat-completions"},
 			ManagementAPI:         true,
-		},
-	}
-}
+			Scheduler:             true,
+			},
+			}
+			}
 
-func wbModels() []pluginapi.ModelInfo {
+			func wbModels() []pluginapi.ModelInfo {
 	return []pluginapi.ModelInfo{
 		{ID: "glm-5.2", Name: "GLM-5.2", ContextLength: 1000000, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
 		{ID: "glm-5.1", Name: "GLM-5.1", ContextLength: 131072, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
@@ -479,18 +497,56 @@ func fetchDynamicModelsFromStorage(storageJSON []byte) []pluginapi.ModelInfo {
 	return fetchDynamicModels()
 }
 
+// realmFromToken decodes the JWT iss claim to determine the account realm.
+// Global tokens have iss=...workbuddy.ai...; CN tokens have iss=...codebuddy.cn...
+// Returns true if the token is Global.
+func isGlobalToken(accessToken string) bool {
+	parts := strings.Split(accessToken, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	payload := parts[1]
+	// base64url padding
+	if pad := len(payload) % 4; pad != 0 {
+		payload += strings.Repeat("=", 4-pad)
+	}
+	raw, err := base64.URLEncoding.DecodeString(payload)
+	if err != nil {
+		return false
+	}
+	var claims struct {
+		ISS string `json:"iss"`
+	}
+	if json.Unmarshal(raw, &claims) != nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(claims.ISS), "workbuddy.ai")
+}
+
 // callModelsAPI GETs /console/enterprises/personal/models from the upstream.
 // Uses the shared client (connection pooling) with a per-request 15s budget;
 // the shared client's own 120s timeout stays as the outer bound.
 func callModelsAPI(accessToken string) ([]pluginapi.ModelInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpointModels, nil)
+	// Model discovery is per-realm: Global tokens must query workbuddy.ai,
+	// not copilot.tencent.com (which 500s for Global tokens). Decode JWT iss.
+	isGlobal := isGlobalToken(accessToken)
+	modelsURL := endpointModels
+	origin := originReferer
+	if isGlobal {
+		modelsURL = upstreamBaseGlobal + "/console/enterprises/personal/models"
+		origin = originRefererGlobal
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsURL, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Referer", origin+"/")
+	req.Header.Set("User-Agent", clientUA)
 	resp, err := sharedHTTPClient().Do(req)
 	if err != nil {
 		return nil, err
@@ -748,37 +804,135 @@ func rewriteModelInBody(body []byte, upstreamModel string) []byte {
 // Usage reporting (request monitoring)
 // ------------------------------------------------------------------------------
 //
-// CPA's built-in executors (xai, codex, ...) publish usage records via
-// helps.UsageReporter; the plugin-executor path does not, so requests handled
-// by this plugin never reach the usage queue / statistics. The plugin shares
-// the host process, so usage.PublishRecord delivers to the same DefaultManager
-// the built-ins use. There is no ctx across the C ABI, so a background context
-// is used — usage sinks (redisqueue etc.) do not depend on request ctx.
+// CPA built-in executors publish via host usage.DefaultManager → redisqueue.
+// Plugin executors cannot: c-shared .so has its own Go runtime, so
+// usage.PublishRecord would hit a separate empty DefaultManager (no sink).
+//
+// Only effective path: POST NDJSON to CPA-Manager-Plus
+// /v0/management/usage/import. Key/URL resolved automatically from
+// config → env → docker secret files (see resolveUsageReport).
+// usage.Detail is still used as a pure token-counter struct.
 
-// publishUsage emits one usage record for an upstream attempt. requestedModel
-// is the client-facing model (possibly an alias), upstreamModel the resolved
-// real model. Token detail is best-effort; failures carry status/body.
+// publishUsage reports one upstream attempt into CPAMP request monitoring.
+// requestedModel is client-facing (may be alias); upstreamModel is resolved.
 func publishUsage(requestedModel, upstreamModel, authID string, started time.Time, detail usage.Detail, failed bool, statusCode int, errBody string) {
 	model := strings.TrimSpace(upstreamModel)
 	if model == "" {
 		model = strings.TrimSpace(requestedModel)
 	}
-	record := usage.Record{
-		Provider:    providerName,
-		Model:       model,
-		Alias:       strings.TrimSpace(requestedModel),
-		AuthID:      strings.TrimSpace(authID),
-		RequestedAt: started,
-		Failed:      failed,
-		Detail:      normalizeUsageDetail(detail),
+	alias := strings.TrimSpace(requestedModel)
+	if alias == "" {
+		alias = model
 	}
+	go reportUsageToCPAMP(alias, model, authID, started, normalizeUsageDetail(detail), failed, statusCode, errBody)
+}
+
+// reportUsageToCPAMP POSTs one NDJSON line to CPAMP usage/import.
+// Silent on misconfig / network errors — never blocks chat.
+func reportUsageToCPAMP(alias, model, authID string, started time.Time, detail usage.Detail, failed bool, statusCode int, errBody string) {
+	usageReportMu.RLock()
+	url := strings.TrimSpace(usageReportURL)
+	key := strings.TrimSpace(usageReportKey)
+	usageReportMu.RUnlock()
+	if url == "" || key == "" {
+		return
+	}
+	ts := started
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	latencyMs := int64(0)
 	if !started.IsZero() {
-		record.Latency = time.Since(started)
+		latencyMs = time.Since(started).Milliseconds()
+		if latencyMs < 0 {
+			latencyMs = 0
+		}
 	}
+	total := detail.TotalTokens
+	if total == 0 {
+		total = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
+	}
+	failBody := ""
+	failCode := 200
 	if failed {
-		record.Fail = usage.Failure{StatusCode: statusCode, Body: truncate(errBody, 512)}
+		failCode = statusCode
+		if failCode <= 0 {
+			failCode = 502
+		}
+		failBody = truncate(redactSecrets(errBody), 512)
 	}
-	usage.PublishRecord(context.Background(), record)
+	payload := map[string]any{
+		"timestamp":    ts.UTC().Format(time.RFC3339Nano),
+		"latency_ms":   latencyMs,
+		"source":       "workbuddy",
+		"auth_index":   strings.TrimSpace(authID),
+		"provider":     providerName,
+		"model":        model,
+		"alias":        alias,
+		"endpoint":     "POST /v1/chat/completions",
+		"auth_type":    "oauth",
+		"executor_type": "workbuddy",
+		"generate":     true,
+		"failed":       failed,
+		"tokens": map[string]any{
+			"input_tokens":          detail.InputTokens,
+			"output_tokens":         detail.OutputTokens,
+			"reasoning_tokens":      detail.ReasoningTokens,
+			"cached_tokens":         detail.CachedTokens,
+			"cache_read_tokens":     detail.CacheReadTokens,
+			"cache_creation_tokens": detail.CacheCreationTokens,
+			"total_tokens":          total,
+		},
+		"fail": map[string]any{
+			"status_code": failCode,
+			"body":        failBody,
+		},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	body = append(body, '\n')
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/x-ndjson")
+	resp, err := sharedHTTPClient().Do(req)
+	if err != nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+}
+
+// redactSecrets strips bearer tokens / JWT-like blobs from error bodies before usage publish.
+func redactSecrets(s string) string {
+	if s == "" {
+		return s
+	}
+	// Bearer tokens
+	s = redactREBearer.ReplaceAllString(s, "Bearer ***")
+	// long JWT-ish segments
+	s = redactREJWT.ReplaceAllString(s, "***jwt***")
+	// access_token / refresh_token query-or-json fragments (best-effort)
+	s = redactRETokenKV.ReplaceAllString(s, "${1}***")
+	return s
+}
+
+var (
+	redactREBearer  = regexp.MustCompile(`(?i)Bearer\s+[A-Za-z0-9._\-+/=]{12,}`)
+	redactREJWT     = regexp.MustCompile(`\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b`)
+	redactRETokenKV = regexp.MustCompile(`(?i)((?:access_token|refresh_token|id_token)\s*[=:]\s*)([A-Za-z0-9._\-+/=]{12,})`)
+)
+
+// truncateRedacted redacts secrets then truncates — use for any error body
+// returned to clients / logs (A-37). publishUsage already redacts Fail.Body.
+func truncateRedacted(s string, n int) string {
+	return truncate(redactSecrets(s), n)
 }
 
 func normalizeUsageDetail(d usage.Detail) usage.Detail {
@@ -864,7 +1018,9 @@ func handleModelStatic(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	cacheModelAliases(req.Host)
-	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: fetchDynamicModels()})
+	models := fetchDynamicModels()
+	models = filterExcludedModels(models, req.Host)
+	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: models})
 }
 
 func handleModelForAuth(raw []byte) ([]byte, error) {
@@ -878,14 +1034,43 @@ func handleModelForAuth(raw []byte) ([]byte, error) {
 	// auth file carries a non-canonical provider string.
 	cacheModelAliases(req.Host)
 	models := fetchDynamicModelsFromStorage(req.StorageJSON)
+	models = filterExcludedModels(models, req.Host)
 	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: models})
 }
 
-func handleFrontendAuth(raw []byte) ([]byte, error) {
-	// WorkBuddy relies on the standard OAuth login flow (auth.login.*).
-	// Returning not-authenticated lets the host fall back to normal auth.
-	return okEnvelope(pluginapi.FrontendAuthResponse{Authenticated: false})
+// filterExcludedModels removes models listed in oauth-excluded-models for
+// the workbuddy provider. The host passes this config via HostConfigSummary.
+func filterExcludedModels(models []pluginapi.ModelInfo, host pluginapi.HostConfigSummary) []pluginapi.ModelInfo {
+	if len(host.ExcludedModels) == 0 {
+		return models
+	}
+	// Try exact provider match, then case-insensitive scan.
+	excluded := host.ExcludedModels[providerName]
+	if len(excluded) == 0 {
+		for channel, list := range host.ExcludedModels {
+			if strings.EqualFold(strings.TrimSpace(channel), providerName) {
+				excluded = list
+				break
+			}
+		}
+	}
+	if len(excluded) == 0 {
+		return models
+	}
+	excludeSet := make(map[string]struct{}, len(excluded))
+	for _, m := range excluded {
+		excludeSet[strings.ToLower(strings.TrimSpace(m))] = struct{}{}
+	}
+	out := models[:0]
+	for _, m := range models {
+		if _, skip := excludeSet[strings.ToLower(m.ID)]; skip {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }
+
 
 // hostAuthListFiles lists all auth files known to the host.
 func hostAuthListFiles() ([]pluginapi.HostAuthFileEntry, error) {
@@ -1047,6 +1232,38 @@ func commonHeaders(req *http.Request) {
 	req.Header.Set("User-Agent", clientUA)
 }
 
+// originRefererFor returns the Origin/Referer base URL appropriate for the
+// account's domain. Global accounts use https://www.workbuddy.ai; CN (and
+// legacy auth files with empty domain) use the default https://www.codebuddy.cn.
+func originRefererFor(sa *storedAuth) string {
+	if sa != nil && isGlobalDomain(sa.Auth.Domain) {
+		return originRefererGlobal
+	}
+	return originReferer
+}
+
+// upstreamBaseFor returns the chat/auth API host for the account realm.
+// Global JWT iss is workbuddy.ai — those tokens only work on www.workbuddy.ai.
+// CN tokens work on copilot.tencent.com. Mixing them yields APISIX 401.
+func upstreamBaseFor(sa *storedAuth) string {
+	if sa != nil && isGlobalDomain(sa.Auth.Domain) {
+		return upstreamBaseGlobal
+	}
+	return upstreamBaseCN
+}
+
+func endpointChatFor(sa *storedAuth) string {
+	return upstreamBaseFor(sa) + "/v2/chat/completions"
+}
+
+func endpointTokenRefreshFor(sa *storedAuth) string {
+	return upstreamBaseFor(sa) + "/v2/plugin/auth/token/refresh"
+}
+
+func endpointModelsFor(sa *storedAuth) string {
+	return upstreamBaseFor(sa) + "/console/enterprises/personal/models"
+}
+
 // backendHeaders applies auth-derived headers to a chat completion request.
 // Empty fields are signalled via the X-No-* convention used by CodeBuddy.
 func backendHeaders(req *http.Request, sa *storedAuth) {
@@ -1075,6 +1292,11 @@ func backendHeaders(req *http.Request, sa *storedAuth) {
 		req.Header.Set("X-No-Department-Info", "1")
 	}
 	req.Header.Set("X-Product", "SaaS")
+	// Override Origin/Referer for Global accounts so the upstream doesn't
+	// reject the request as cross-origin.
+	origin := originRefererFor(sa)
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Referer", origin+"/")
 }
 
 // doJSON sends method to fullURL with the given headers, parses the {code,msg,data}
@@ -1109,7 +1331,7 @@ func doJSON(client *http.Client, method, fullURL string, headers func(*http.Requ
 		return nil, resp.StatusCode, fmt.Errorf("parse failed: %w", err)
 	}
 	if env.Code != 0 {
-		return nil, resp.StatusCode, fmt.Errorf("code=%d msg=%s", env.Code, env.Msg)
+		return nil, resp.StatusCode, fmt.Errorf("code=%d msg=%s", env.Code, truncateRedacted(env.Msg, 120))
 	}
 	return env.Data, resp.StatusCode, nil
 }
@@ -1128,38 +1350,52 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 		// Not a workbuddy credential; let the host try other providers.
 		return okEnvelope(pluginapi.AuthParseResponse{Handled: false})
 	}
+	// CRITICAL: echo back the host-provided FileName AND leave ID empty.
+	//
+	// CPA uses ID for auth record identity (upsert key). If we set ID=uid
+	// while the host's watcher initially registered with ID=filename,
+	// upsertAuthRecord can't find the existing record → creates a NEW one
+	// → duplicate auth entries (same file, different IDs).
+	//
+	// By leaving ID empty, CPA falls back to authIDForPath(path) which
+	// derives ID from the file path → always matches the watcher's key.
+	// FileName is also echoed back to avoid rename-based duplicates.
+	ad := toAuthDataOpts(sa, nil, false)
+	ad.ID = "" // let host compute from path (prevents ID mismatch dupes)
+	if fn := strings.TrimSpace(req.FileName); fn != "" {
+		ad.FileName = fn
+	}
 	return okEnvelope(pluginapi.AuthParseResponse{
 		Handled: true,
-		Auth:    toAuthData(sa),
+		Auth:    ad,
 	})
 }
 
 func toAuthData(sa *storedAuth) pluginapi.AuthData {
+	return toAuthDataOpts(sa, nil, false)
+}
+
+// toAuthDataOpts builds AuthData with optional credits snapshot and disabled flag.
+func toAuthDataOpts(sa *storedAuth, cr *creditsSummary, disabled bool) pluginapi.AuthData {
 	storage, _ := json.Marshal(sa)
 	id := providerName
 	fileName := authFileName
-	label := "WorkBuddy"
 	if sa != nil && strings.TrimSpace(sa.Account.UID) != "" {
 		id = sa.Account.UID
 		fileName = "workbuddy-" + sa.Account.UID + ".json"
-		if strings.TrimSpace(sa.Account.Nickname) != "" {
-			label = sa.Account.Nickname
-		}
 	}
+	label := labelForAuth(sa)
+	meta := enrichAuthMetadata(sa, cr, disabled)
 	return pluginapi.AuthData{
 		Provider:    providerName,
 		ID:          id,
 		FileName:    fileName,
 		Label:       label,
+		Disabled:    disabled,
 		StorageJSON: storage,
 		// Standardized auth metadata. `type` is required by the host for
-		// auth-file classification; `logo` lets the management UI show the
-		// provider icon on auth rows (frontend reads e.logo || e.metadata.logo).
-		Metadata: map[string]any{
-			"type":     providerName,
-			"provider": providerName,
-			"logo":     pluginLogoURL,
-		},
+		// auth-file classification; `logo`/`note`/`disabled` surface on auth rows.
+		Metadata: meta,
 	}
 }
 
@@ -1271,6 +1507,22 @@ func preserveExpiry(newExpiry, oldExpiry int64) int64 {
 	return oldExpiry
 }
 
+// toAuthDataForRefresh returns AuthData with FileName left EMPTY so the CPA
+// host backfills the original auth.FileName (auth_provider.go:371).
+//
+// CPA uses FileName (relative to auth dir) as auth ID. If we set it to
+// "workbuddy-<uid>.json" while the original file was "workbuddy.json"
+// (legacy single-account name), the host treats it as a rename, writes a
+// NEW file, and the old one stays → duplicate auth records.
+//
+// Returning empty FileName = "keep what you had" → no rename, no dup.
+func toAuthDataForRefresh(sa *storedAuth) pluginapi.AuthData {
+	ad := toAuthDataOpts(sa, nil, false)
+	ad.FileName = "" // let host backfill original
+	ad.ID = ""      // let host compute from path (prevents ID mismatch dupes)
+	return ad
+}
+
 func handleRefreshAuth(raw []byte) ([]byte, error) {
 	var req pluginapi.AuthRefreshRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -1288,7 +1540,7 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 		}
 		r.Header.Set("X-Auth-Refresh-Source", providerName)
 	}
-	data, status, err := doJSON(sharedHTTPClient(), http.MethodPost, endpointTokenRefresh, headers, nil)
+	data, status, err := doJSON(sharedHTTPClient(), http.MethodPost, endpointTokenRefreshFor(sa), headers, nil)
 	if err != nil {
 		if status >= 400 {
 			return nil, fmt.Errorf("refresh rejected (HTTP %d)", status)
@@ -1314,7 +1566,7 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	// refreshed credential itself after Refresh returns (conductor.go
 	// refreshAuth → m.Update → persist). Writing from the plugin too would
 	// double-write the file.
-	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthData(sa)})
+	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthDataForRefresh(sa)})
 }
 
 // -----------------------------------------------------------------------------
@@ -1343,7 +1595,8 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	// Normalize OpenAI tool_choice/tools before rewrite — upstream only accepts
 	// string tool_choice, and ignores "none" when tools[] is present.
 	body := rewriteModelInBody(normalizeToolsForUpstream(rewriteSystemForUpstream(forceStreamBody(req.Payload, req.OriginalRequest))), upstreamModel)
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
+	body = ensureSystemMessage(body, sa)
+	httpReq, err := http.NewRequest(http.MethodPost, endpointChatFor(sa), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -1357,7 +1610,8 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	if resp.StatusCode >= 400 {
 		payload, _ := io.ReadAll(resp.Body)
 		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, resp.StatusCode, string(payload))
-		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncate(string(payload), 200))
+		reconcileAfterExecutorError(req.AuthID, resp.StatusCode, string(payload))
+		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncateRedacted(string(payload), 200))
 	}
 	completion, err := aggregateCompletion(resp.Body, req.Model)
 	if err != nil {
@@ -1365,6 +1619,7 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	publishUsage(req.Model, upstreamModel, authUID, started, usageDetailFromCompletion(completion), false, 0, "")
+	invalidateAccountCredits(req.AuthID, authUID)
 	return okEnvelope(pluginapi.ExecutorResponse{Payload: completion})
 }
 
@@ -1395,7 +1650,8 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	if len(body) == 0 {
 		body = req.OriginalRequest
 	}
-	body = rewriteModelInBody(normalizeToolsForUpstream(rewriteSystemForUpstream(body)), upstreamModel)
+	body = rewriteModelInBody(normalizeToolsForUpstream(rewriteSystemForUpstream(forceStreamBody(body, nil))), upstreamModel)
+	body = ensureSystemMessage(body, sa)
 
 	headers := streamHeaders()
 	sseFramed := clientNeedsSSEFrame(req.Metadata)
@@ -1409,19 +1665,20 @@ func handleExecStream(raw []byte) ([]byte, error) {
 			return nil, errCollect
 		}
 		publishUsage(req.Model, upstreamModel, authUID, started, collector.detail(), false, 0, "")
+		invalidateAccountCredits(req.AuthID, authUID)
 		return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
 	}
 
 	// Async: return immediately with empty chunks. A goroutine pumps the upstream
 	// and emits each chunk via host.stream.emit so the client sees true streaming.
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
+	httpReq, err := http.NewRequest(http.MethodPost, endpointChatFor(sa), bytes.NewReader(body))
 	if err != nil {
 		streamEmitError(req.StreamID, err.Error())
 		streamClose(req.StreamID)
 		return okEnvelope(streamResponse{Headers: headers})
 	}
 	backendHeaders(httpReq, sa)
-	go pumpUpstreamStream(httpReq, req.StreamID, sseFramed, req.Model, upstreamModel, authUID, started)
+	go pumpUpstreamStream(httpReq, req.StreamID, sseFramed, req.Model, upstreamModel, authUID, started, req.AuthID)
 	return okEnvelope(streamResponse{Headers: headers})
 }
 
@@ -1437,20 +1694,32 @@ func streamHeaders() http.Header {
 // emits each cleaned chunk to the host stream. It closes the stream when done.
 // An emit failure (client disconnected → host closed the stream) aborts the
 // pump so we stop reading a dead upstream.
-func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool, requestedModel, upstreamModel, authUID string, started time.Time) {
+func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool, requestedModel, upstreamModel, authUID string, started time.Time, authID string) {
+	// Always close the host stream exactly once on every exit path.
+	closed := false
+	closeOnce := func() {
+		if closed {
+			return
+		}
+		closed = true
+		streamClose(streamID)
+	}
+	defer closeOnce()
+
 	resp, err := sharedHTTPClient().Do(httpReq)
 	if err != nil {
 		publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
 		streamEmitError(streamID, fmt.Sprintf("http_error: %v", err))
-		streamClose(streamID)
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		errPayload, _ := io.ReadAll(resp.Body)
 		publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, resp.StatusCode, string(errPayload))
-		streamEmitError(streamID, fmt.Sprintf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200)))
-		streamClose(streamID)
+		if authUID != "" {
+			go reconcileByUID(authUID, resp.StatusCode, string(errPayload))
+		}
+		streamEmitError(streamID, fmt.Sprintf("upstream %d: %s", resp.StatusCode, truncateRedacted(string(errPayload), 200)))
 		return
 	}
 	collector := &sseUsageCollector{}
@@ -1470,7 +1739,9 @@ func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool, 
 			cleaned = "data: " + cleaned
 		}
 		if err := streamEmit(streamID, []byte(cleaned)); err != nil {
-			break
+			// Client disconnected / host closed stream — abort; do not report success.
+			publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), true, 0, "stream_emit: "+err.Error())
+			return
 		}
 	}
 	// A mid-stream read failure means the client received a truncated stream:
@@ -1478,11 +1749,10 @@ func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool, 
 	if err := scanner.Err(); err != nil {
 		publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), true, 0, err.Error())
 		streamEmitError(streamID, fmt.Sprintf("upstream stream read error: %v", err))
-		streamClose(streamID)
 		return
 	}
 	publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), false, 0, "")
-	streamClose(streamID)
+	invalidateAccountCredits(authID, authUID)
 }
 
 // collectUpstreamStream is the synchronous fallback (no async stream id): drain
@@ -1490,7 +1760,7 @@ func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool, 
 // non-nil, observes raw upstream chunks for usage extraction. statusCode is the
 // upstream HTTP status (0 for transport-level failures).
 func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool, collector *sseUsageCollector) ([]pluginapi.ExecutorStreamChunk, int, error) {
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
+	httpReq, err := http.NewRequest(http.MethodPost, endpointChatFor(sa), bytes.NewReader(body))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1502,7 +1772,10 @@ func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool, collecto
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		errPayload, _ := io.ReadAll(resp.Body)
-		return nil, resp.StatusCode, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200))
+		if sa != nil && sa.Account.UID != "" {
+			go reconcileByUID(sa.Account.UID, resp.StatusCode, string(errPayload))
+		}
+		return nil, resp.StatusCode, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncateRedacted(string(errPayload), 200))
 	}
 	chunks, errAgg := aggregateSSEWithCollector(resp.Body, sseFramed, collector)
 	if errAgg != nil {
@@ -1592,6 +1865,14 @@ func cleanChunkJSON(s string) string {
 			if v, present := delta["tool_calls"]; present {
 				if arr, isArr := v.([]any); isArr && len(arr) == 0 {
 					delete(delta, "tool_calls")
+					changed = true
+				}
+			}
+			// Upstream often pads terminal/noop deltas with empty noise fields
+			// that clients ignore but pollute wire size / some parsers.
+			for _, noise := range []string{"extra_fields", "refusal", "reasoning_content"} {
+				if v, present := delta[noise]; present && isEmptyValue(v) {
+					delete(delta, noise)
 					changed = true
 				}
 			}
@@ -1782,6 +2063,48 @@ func rewriteSystemForUpstream(payload []byte) []byte {
 	if !changed {
 		return payload
 	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return payload
+	}
+	return out
+}
+
+// ensureSystemMessage injects a minimal system message if none is present.
+// Global (www.workbuddy.ai) rejects user-only requests with code 11101
+// "Parse message failed: 11101:invalid request". CN (copilot.tencent.com)
+// does not require a system message but tolerates one. Inserting a
+// harmless system message unifies both paths.
+func ensureSystemMessage(payload []byte, sa *storedAuth) []byte {
+	if len(payload) == 0 {
+		return payload
+	}
+	// Only inject for Global; CN doesn't need it and we minimize diff.
+	if sa == nil || !isGlobalDomain(sa.Auth.Domain) {
+		return payload
+	}
+	var obj map[string]any
+	if json.Unmarshal(payload, &obj) != nil {
+		return payload
+	}
+	messages, ok := obj["messages"].([]any)
+	if !ok || len(messages) == 0 {
+		return payload
+	}
+	for _, m := range messages {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		if role, _ := msg["role"].(string); strings.EqualFold(role, "system") {
+			return payload // already has system message
+		}
+	}
+	systemMsg := map[string]any{
+		"role":    "system",
+		"content": "You are a helpful assistant.",
+	}
+	obj["messages"] = append([]any{systemMsg}, messages...)
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return payload
@@ -1999,8 +2322,8 @@ func mergeToolCallDelta(merged, delta map[string]any) {
 
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
-		if v != "" {
-			return v
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
 		}
 	}
 	return ""
