@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.23
+
+### Fixed
+- usage import URL 自动探测：先试 127.0.0.1:18317（裸机/Docker host），再试 Docker 服务名 cpa-manager-plus:18317
+  不再写死 Docker 服务名，裸机安装也能自动找到 CPAMP
+
 ## 0.6.22
 
 ### Fixed
