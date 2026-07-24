@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.10
+
+### Fixed
+- **批量签到先过滤再操作**：Global 不参与；今日已签跳过；仅对 CN 未签账号调用 daily-checkin
+- 返回 `summary{success,already,skipped_global,fail,eligible}`，面板文案不再把 Global/已签当失败
+- 分类/签到并发（限流），降低「全部签到」卡到 502 context canceled
+
+## 0.6.9
+
+### Changed
+- **Panel theme adaptive**: CSS variables now default to light (paper) theme; `[data-theme="white"]` and `[data-theme="dark"]` overrides align with CPA management panel tokens. Embedded iframe mirrors parent `data-theme` via MutationObserver; standalone page follows `prefers-color-scheme`. All hardcoded dark colors (toast, modal, input, buttons) replaced with theme-aware CSS variables.
+
 ## 0.6.3
 
 ### Fixed

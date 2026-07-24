@@ -1191,12 +1191,27 @@ func mgmtHTMLResponse(body []byte) pluginapi.ManagementResponse {
 	return pluginapi.ManagementResponse{StatusCode: http.StatusOK, Headers: h, Body: body}
 }
 
+// checkinCandidate is a CN account that still needs daily check-in after prefilter.
+type checkinCandidate struct {
+	authIndex string
+	nickname  string
+	sa        *storedAuth
+}
+
+// handleManualCheckin prefilters before any check-in call:
+//  1. Global → skip (trial pack, not daily check-in)
+//  2. CN already checked in today → skip (not a failure)
+//  3. Only remaining CN accounts call performCheckinCall
+//
+// Batch mode (empty auth_index) never returns Global/already as fake failures.
+// Single-account mode still returns a clear skip message for Global/already.
 func handleManualCheckin(req pluginapi.ManagementRequest) map[string]any {
 	var body struct {
 		AuthIndex string `json:"auth_index"`
 	}
 	_ = json.Unmarshal(req.Body, &body)
 	authIndex := strings.TrimSpace(body.AuthIndex)
+	single := authIndex != ""
 
 	files, err := hostAuthList()
 	if err != nil {
@@ -1204,67 +1219,245 @@ func handleManualCheckin(req pluginapi.ManagementRequest) map[string]any {
 	}
 	var targets []pluginapi.HostAuthFileEntry
 	for _, f := range files {
-		if authIndex == "" || f.AuthIndex == authIndex {
+		if !single || f.AuthIndex == authIndex {
 			targets = append(targets, f)
 		}
 	}
 	if len(targets) == 0 {
 		return map[string]any{"error": "no matching account"}
 	}
-	results := make([]map[string]any, 0, len(targets))
-	for _, f := range targets {
-		// Per-account lock: multi-tab concurrent check-in on the same account
-		// serializes; upstream is mostly idempotent but this avoids stampede.
-		mu := checkinLockFor(f.AuthIndex)
-		mu.Lock()
-		sa, err := hostAuthGet(f.AuthIndex)
-		if err != nil {
-			mu.Unlock()
-			results = append(results, map[string]any{"auth_index": f.AuthIndex, "error": err.Error()})
+
+	// --- Phase 1: classify (filter) before any check-in side effect ---
+	var (
+		skippedGlobal int
+		already       int
+		eligible      []checkinCandidate
+		results       []map[string]any
+	)
+	// Concurrent classify: N accounts × status API; serial was multi-second and
+	// could trip browser/gateway cancel (502 context canceled).
+	type classResult struct {
+		idx    int
+		f      pluginapi.HostAuthFileEntry
+		sa     *storedAuth
+		kind   string // "err" | "global" | "already" | "eligible"
+		nick   string
+		errMsg string
+	}
+	classCh := make(chan classResult, len(targets))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 6) // bound upstream concurrency
+	for i, f := range targets {
+		wg.Add(1)
+		go func(i int, f pluginapi.HostAuthFileEntry) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			sa, err := hostAuthGet(f.AuthIndex)
+			if err != nil {
+				classCh <- classResult{idx: i, f: f, kind: "err", errMsg: err.Error()}
+				return
+			}
+			nick := sa.Account.Nickname
+			if isGlobalDomain(sa.Auth.Domain) {
+				classCh <- classResult{idx: i, f: f, sa: sa, kind: "global", nick: nick}
+				return
+			}
+			// Prefer fresh status; fall back to cache today_checked_in if status fails.
+			ci, ciErr := fetchCheckinStatus(sa)
+			if ciErr != nil {
+				if cached := cachedCheckinToday(f.AuthIndex); cached != nil && *cached {
+					classCh <- classResult{idx: i, f: f, sa: sa, kind: "already", nick: nick}
+					return
+				}
+				// Status unknown → still try check-in (upstream is idempotent).
+				classCh <- classResult{idx: i, f: f, sa: sa, kind: "eligible", nick: nick}
+				return
+			}
+			if ci != nil && ci.TodayCheckedIn {
+				classCh <- classResult{idx: i, f: f, sa: sa, kind: "already", nick: nick}
+				return
+			}
+			classCh <- classResult{idx: i, f: f, sa: sa, kind: "eligible", nick: nick}
+		}(i, f)
+	}
+	go func() { wg.Wait(); close(classCh) }()
+	// Preserve input order for stable UI.
+	classified := make([]classResult, len(targets))
+	got := 0
+	for cr := range classCh {
+		classified[cr.idx] = cr
+		got++
+	}
+	_ = got
+	for _, cr := range classified {
+		if cr.kind == "" {
 			continue
 		}
-		// Global accounts don't use daily check-in — they use the expert trial
-		// pack instead.  Skip them in batch/single check-in.
-		if isGlobalDomain(sa.Auth.Domain) {
+		switch cr.kind {
+		case "err":
 			results = append(results, map[string]any{
-				"auth_index": f.AuthIndex, "nickname": sa.Account.Nickname,
-				"success": false, "message": "国际版账号不支持签到，请使用领取专家加油包",
+				"auth_index": cr.f.AuthIndex, "error": cr.errMsg, "skipped": false,
 			})
-			mu.Unlock()
-			continue
-		}
-		ci, _ := fetchCheckinStatus(sa)
-		if ci != nil && ci.Active && ci.TodayCheckedIn {
-			results = append(results, map[string]any{
-				"auth_index": f.AuthIndex, "nickname": sa.Account.Nickname,
-				"success": false, "message": "already checked in today",
-			})
-			accountCache.Delete(f.AuthIndex)
-			mu.Unlock()
-			// After unlock: recheck credits (reenable may take the same lock).
+		case "global":
+			skippedGlobal++
+			if single {
+				results = append(results, map[string]any{
+					"auth_index": cr.f.AuthIndex, "nickname": cr.nick,
+					"success": false, "skipped": true, "reason": "global",
+					"message": "国际版账号不支持签到，请使用领取专家加油包",
+				})
+			}
+		case "already":
+			already++
+			// Light cache refresh path for reenable after prior disable.
+			accountCache.Delete(cr.f.AuthIndex)
 			if lifecycleEnabled() {
-				_, _ = reconcileOneAccount(f.AuthIndex, true)
+				_, _ = reconcileOneAccount(cr.f.AuthIndex, true)
 			}
-			continue
-		}
-		res, err := performCheckinCall(sa)
-		out := map[string]any{"auth_index": f.AuthIndex, "nickname": sa.Account.Nickname}
-		if err != nil {
-			out["error"] = err.Error()
-		} else {
-			for k, v := range res {
-				out[k] = v
+			if single {
+				results = append(results, map[string]any{
+					"auth_index": cr.f.AuthIndex, "nickname": cr.nick,
+					"success": true, "skipped": true, "reason": "already",
+					"message": "already checked in today",
+				})
 			}
-		}
-		results = append(results, out)
-		accountCache.Delete(f.AuthIndex)
-		mu.Unlock()
-		// After unlock: re-evaluate credits → may reenable or keep disabled.
-		if lifecycleEnabled() {
-			_, _ = reconcileOneAccount(f.AuthIndex, true)
+		case "eligible":
+			eligible = append(eligible, checkinCandidate{
+				authIndex: cr.f.AuthIndex, nickname: cr.nick, sa: cr.sa,
+			})
 		}
 	}
-	return map[string]any{"results": results}
+
+	// --- Phase 2: check-in only filtered CN accounts ---
+	type checkinOut struct {
+		idx int
+		out map[string]any
+	}
+	outCh := make(chan checkinOut, len(eligible))
+	var wg2 sync.WaitGroup
+	sem2 := make(chan struct{}, 4)
+	for i, c := range eligible {
+		wg2.Add(1)
+		go func(i int, c checkinCandidate) {
+			defer wg2.Done()
+			sem2 <- struct{}{}
+			defer func() { <-sem2 }()
+			mu := checkinLockFor(c.authIndex)
+			mu.Lock()
+			// Re-read under lock: another tab may have just checked in.
+			sa := c.sa
+			if sa2, err := hostAuthGet(c.authIndex); err == nil && sa2 != nil {
+				sa = sa2
+			}
+			if ci, _ := fetchCheckinStatus(sa); ci != nil && ci.TodayCheckedIn {
+				mu.Unlock()
+				outCh <- checkinOut{idx: i, out: map[string]any{
+					"auth_index": c.authIndex, "nickname": c.nickname,
+					"success": true, "skipped": true, "reason": "already",
+					"message": "already checked in today",
+				}}
+				accountCache.Delete(c.authIndex)
+				if lifecycleEnabled() {
+					_, _ = reconcileOneAccount(c.authIndex, true)
+				}
+				return
+			}
+			res, err := performCheckinCall(sa)
+			out := map[string]any{"auth_index": c.authIndex, "nickname": c.nickname, "skipped": false}
+			if err != nil {
+				out["error"] = err.Error()
+				out["success"] = false
+			} else {
+				// performCheckinCall surfaces business errors as success=false+message.
+				for k, v := range res {
+					out[k] = v
+				}
+				if msg, _ := out["message"].(string); msg != "" && out["success"] == false {
+					// Map "already" style business messages to done, not hard fail.
+					low := strings.ToLower(msg)
+					if strings.Contains(low, "already") || strings.Contains(msg, "已签") || strings.Contains(msg, "今日") {
+						out["success"] = true
+						out["skipped"] = true
+						out["reason"] = "already"
+					}
+				}
+				if _, ok := out["success"]; !ok {
+					out["success"] = true
+				}
+			}
+			accountCache.Delete(c.authIndex)
+			mu.Unlock()
+			if lifecycleEnabled() {
+				_, _ = reconcileOneAccount(c.authIndex, true)
+			}
+			outCh <- checkinOut{idx: i, out: out}
+		}(i, c)
+	}
+	go func() { wg2.Wait(); close(outCh) }()
+	phase2 := make([]map[string]any, len(eligible))
+	for o := range outCh {
+		phase2[o.idx] = o.out
+	}
+	successN, failN, already2 := 0, 0, 0
+	for _, out := range phase2 {
+		if out == nil {
+			continue
+		}
+		results = append(results, out)
+		if out["error"] != nil {
+			failN++
+			continue
+		}
+		if reason, _ := out["reason"].(string); reason == "already" || out["skipped"] == true {
+			// late already under lock
+			if reason == "already" {
+				already2++
+			}
+		}
+		if out["success"] == true {
+			if reason, _ := out["reason"].(string); reason == "already" {
+				// counted in already2
+			} else {
+				successN++
+			}
+		} else if out["error"] == nil && out["success"] == false {
+			// business soft-fail without error field
+			msg, _ := out["message"].(string)
+			if strings.Contains(strings.ToLower(msg), "already") || strings.Contains(msg, "已签") {
+				already2++
+			} else {
+				failN++
+			}
+		}
+	}
+	alreadyTotal := already + already2
+	return map[string]any{
+		"results": results,
+		"summary": map[string]any{
+			"total":          len(targets),
+			"eligible":       len(eligible),
+			"success":        successN,
+			"already":        alreadyTotal,
+			"skipped_global": skippedGlobal,
+			"fail":           failN,
+			"attempted":      len(eligible),
+		},
+	}
+}
+
+// cachedCheckinToday returns cached today_checked_in when present.
+func cachedCheckinToday(authIndex string) *bool {
+	v, ok := accountCache.Load(authIndex)
+	if !ok {
+		return nil
+	}
+	e, ok := v.(*accountCacheEntry)
+	if !ok || e == nil || e.checkin == nil {
+		return nil
+	}
+	b := e.checkin.TodayCheckedIn
+	return &b
 }
 
 // checkinLocks serializes per-account manual check-in (B4).
